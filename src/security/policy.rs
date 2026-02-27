@@ -894,6 +894,13 @@ impl SecurityPolicy {
 
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
+        // Full autonomy with workspace_only disabled explicitly opts out of
+        // path sandboxing checks. Keep this fast-path first so callers in all
+        // modes (CLI/daemon/channels) observe identical behavior.
+        if self.autonomy == AutonomyLevel::Full && !self.workspace_only {
+            return true;
+        }
+
         // Block null bytes (can truncate paths in C-backed syscalls)
         if path.contains('\0') {
             return false;
@@ -941,6 +948,12 @@ impl SecurityPolicy {
     /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        // Keep resolved-path checks aligned with is_path_allowed: in full mode
+        // with workspace sandbox disabled, path access is unrestricted.
+        if self.autonomy == AutonomyLevel::Full && !self.workspace_only {
+            return true;
+        }
+
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self
@@ -1955,14 +1968,27 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_respects_forbidden_paths() {
+    fn full_autonomy_with_workspace_sandbox_disabled_allows_any_path() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/etc/shadow"));
-        assert!(!p.is_path_allowed("/root/.bashrc"));
+        assert!(p.is_path_allowed("/etc/shadow"));
+        assert!(p.is_path_allowed("/root/.bashrc"));
+        assert!(p.is_path_allowed("../outside/workspace"));
+    }
+
+    #[test]
+    fn full_autonomy_with_workspace_sandbox_disabled_allows_any_resolved_path() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_resolved_path_allowed(Path::new("/etc/passwd")));
+        assert!(p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")));
     }
 
     #[test]
