@@ -1,6 +1,6 @@
 # Tài liệu tham khảo Channels
 
-Tài liệu này là nguồn tham khảo chính thức về cấu hình channel trong ZeroClaw.
+Tài liệu này là nguồn tham khảo chính thức về cấu hình channel trong FreeClaw.
 
 Với các phòng Matrix được mã hóa, xem hướng dẫn chuyên biệt:
 - [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md)
@@ -21,13 +21,13 @@ Với các phòng Matrix được mã hóa, xem hướng dẫn chuyên biệt:
 3. **Token/tài khoản không khớp**: token hợp lệ nhưng thuộc tài khoản Matrix khác.
 4. **Thiếu E2EE device identity**: `whoami` không trả về `device_id` và config không cung cấp giá trị này.
 5. **Thiếu key sharing/trust**: các khóa room chưa được chia sẻ cho thiết bị bot, nên không thể giải mã sự kiện mã hóa.
-6. **Trạng thái runtime cũ**: config đã thay đổi nhưng `zeroclaw daemon` chưa được khởi động lại.
+6. **Trạng thái runtime cũ**: config đã thay đổi nhưng `freeclaw daemon` chưa được khởi động lại.
 
 ---
 
 ## 1. Namespace cấu hình
 
-Tất cả cài đặt channel nằm trong `channels_config` trong `~/.zeroclaw/config.toml`.
+Tất cả cài đặt channel nằm trong `channels_config` trong `~/.freeclaw/config.toml`.
 
 ```toml
 [channels_config]
@@ -38,7 +38,7 @@ Mỗi channel được bật bằng cách tạo sub-table tương ứng (ví d�
 
 ## Chuyển đổi model runtime trong chat (Telegram / Discord)
 
-Khi chạy `zeroclaw channel start` (hoặc chế độ daemon), Telegram và Discord hỗ trợ chuyển đổi runtime theo phạm vi người gửi:
+Khi chạy `freeclaw channel start` (hoặc chế độ daemon), Telegram và Discord hỗ trợ chuyển đổi runtime theo phạm vi người gửi:
 
 - `/models` — hiển thị các provider hiện có và lựa chọn hiện tại
 - `/models <provider>` — chuyển provider cho phiên người gửi hiện tại
@@ -48,12 +48,12 @@ Khi chạy `zeroclaw channel start` (hoặc chế độ daemon), Telegram và Di
 Lưu ý:
 
 - Việc chuyển đổi chỉ xóa lịch sử hội thoại trong bộ nhớ của người gửi đó, tránh ô nhiễm ngữ cảnh giữa các model.
-- Xem trước bộ nhớ cache model từ `zeroclaw models refresh --provider <ID>`.
+- Xem trước bộ nhớ cache model từ `freeclaw models refresh --provider <ID>`.
 - Đây là lệnh chat runtime, không phải lệnh con CLI.
 
 ## Giao thức marker hình ảnh đầu vào
 
-ZeroClaw hỗ trợ đầu vào multimodal qua các marker nội tuyến trong tin nhắn:
+FreeClaw hỗ trợ đầu vào multimodal qua các marker nội tuyến trong tin nhắn:
 
 - Cú pháp: ``[IMAGE:<source>]``
 - `<source>` có thể là:
@@ -86,7 +86,7 @@ cargo check --no-default-features --features hardware
 cargo check --no-default-features --features hardware,channel-matrix
 ```
 
-Nếu `[channels_config.matrix]` có mặt nhưng binary được build mà không có `channel-matrix`, các lệnh `zeroclaw channel list`, `zeroclaw channel doctor`, và `zeroclaw channel start` sẽ ghi log rằng Matrix bị bỏ qua có chủ ý trong bản build này.
+Nếu `[channels_config.matrix]` có mặt nhưng binary được build mà không có `channel-matrix`, các lệnh `freeclaw channel list`, `freeclaw channel doctor`, và `freeclaw channel start` sẽ ghi log rằng Matrix bị bỏ qua có chủ ý trong bản build này.
 
 ---
 
@@ -186,7 +186,7 @@ allowed_users = ["*"]
 [channels_config.matrix]
 homeserver = "https://matrix.example.com"
 access_token = "syt_..."
-user_id = "@zeroclaw:matrix.example.com"   # tùy chọn, khuyến nghị cho E2EE
+user_id = "@freeclaw:matrix.example.com"   # tùy chọn, khuyến nghị cho E2EE
 device_id = "DEVICEID123"                  # tùy chọn, khuyến nghị cho E2EE
 room_id = "!room:matrix.example.com"       # hoặc room alias (#ops:matrix.example.com)
 allowed_users = ["*"]
@@ -208,7 +208,7 @@ ignore_stories = true
 
 ### 4.7 WhatsApp
 
-ZeroClaw hỗ trợ hai backend WhatsApp:
+FreeClaw hỗ trợ hai backend WhatsApp:
 
 - **Chế độ Cloud API** (`phone_number_id` + `access_token` + `verify_token`)
 - **Chế độ WhatsApp Web** (`session_path`, yêu cầu build flag `--features whatsapp-web`)
@@ -228,7 +228,7 @@ Chế độ WhatsApp Web:
 
 ```toml
 [channels_config.whatsapp]
-session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+session_path = "~/.freeclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # tùy chọn; bỏ qua để dùng QR flow
 pair_code = ""                     # tùy chọn pair code tùy chỉnh
 allowed_numbers = ["*"]
@@ -275,9 +275,9 @@ allowed_senders = ["*"]
 [channels_config.irc]
 server = "irc.libera.chat"
 port = 6697
-nickname = "zeroclaw-bot"
-username = "zeroclaw"              # tùy chọn
-channels = ["#zeroclaw"]
+nickname = "freeclaw-bot"
+username = "freeclaw"              # tùy chọn
+channels = ["#freeclaw"]
 allowed_users = ["*"]
 server_password = ""                # tùy chọn
 nickserv_password = ""              # tùy chọn
@@ -302,7 +302,7 @@ port = 8081                          # bắt buộc ở chế độ webhook
 Hỗ trợ onboarding tương tác:
 
 ```bash
-zeroclaw onboard --interactive
+freeclaw onboard --interactive
 ```
 
 Trình hướng dẫn bao gồm bước **Lark/Feishu** chuyên biệt với:
@@ -351,8 +351,8 @@ allowed_contacts = ["*"]
 2. Chạy:
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+freeclaw onboard --channels-only
+freeclaw daemon
 ```
 
 3. Gửi tin nhắn từ người gửi dự kiến.
@@ -371,7 +371,7 @@ Nếu channel có vẻ đã kết nối nhưng không phản hồi:
 4. Xác nhận giả định về chế độ truyền tải:
    - Các channel polling/websocket không cần HTTP inbound công khai
    - Các channel webhook cần HTTPS callback có thể truy cập được
-5. Khởi động lại `zeroclaw daemon` sau khi thay đổi config.
+5. Khởi động lại `freeclaw daemon` sau khi thay đổi config.
 
 Đặc biệt với các phòng Matrix mã hóa, dùng:
 - [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md)
@@ -385,13 +385,13 @@ Dùng phụ lục này để phân loại sự cố nhanh. Khớp từ khóa log
 ### 7.1 Lệnh capture được khuyến nghị
 
 ```bash
-RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
+RUST_LOG=info freeclaw daemon 2>&1 | tee /tmp/freeclaw.log
 ```
 
 Sau đó lọc các sự kiện channel/gateway:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Webhook|Channel" /tmp/freeclaw.log
 ```
 
 ### 7.2 Bảng từ khóa

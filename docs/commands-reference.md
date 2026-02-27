@@ -1,6 +1,6 @@
-# ZeroClaw Commands Reference
+# FreeClaw Commands Reference
 
-This reference is derived from the current CLI surface (`zeroclaw --help`).
+This reference is derived from the current CLI surface (`freeclaw --help`).
 
 Last verified: **February 21, 2026**.
 
@@ -32,13 +32,13 @@ Last verified: **February 21, 2026**.
 
 ### `onboard`
 
-- `zeroclaw onboard`
-- `zeroclaw onboard --interactive`
-- `zeroclaw onboard --channels-only`
-- `zeroclaw onboard --force`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
+- `freeclaw onboard`
+- `freeclaw onboard --interactive`
+- `freeclaw onboard --channels-only`
+- `freeclaw onboard --force`
+- `freeclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `freeclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `freeclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
 
 `onboard` safety behavior:
 
@@ -46,14 +46,14 @@ Last verified: **February 21, 2026**.
   - Full onboarding (overwrite `config.toml`)
   - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
-- Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- Use `freeclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
 
 ### `agent`
 
-- `zeroclaw agent`
-- `zeroclaw agent -m "Hello"`
-- `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
+- `freeclaw agent`
+- `freeclaw agent -m "Hello"`
+- `freeclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
+- `freeclaw agent --peripheral <board:path>`
 
 Tip:
 
@@ -61,21 +61,21 @@ Tip:
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
-- `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+- `freeclaw gateway [--host <HOST>] [--port <PORT>]`
+- `freeclaw daemon [--host <HOST>] [--port <PORT>]`
 
 ### `estop`
 
-- `zeroclaw estop` (engage `kill-all`)
-- `zeroclaw estop --level network-kill`
-- `zeroclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
-- `zeroclaw estop --level tool-freeze --tool shell [--tool browser]`
-- `zeroclaw estop status`
-- `zeroclaw estop resume`
-- `zeroclaw estop resume --network`
-- `zeroclaw estop resume --domain "*.chase.com"`
-- `zeroclaw estop resume --tool shell`
-- `zeroclaw estop resume --otp <123456>`
+- `freeclaw estop` (engage `kill-all`)
+- `freeclaw estop --level network-kill`
+- `freeclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
+- `freeclaw estop --level tool-freeze --tool shell [--tool browser]`
+- `freeclaw estop status`
+- `freeclaw estop resume`
+- `freeclaw estop resume --network`
+- `freeclaw estop resume --domain "*.chase.com"`
+- `freeclaw estop resume --tool shell`
+- `freeclaw estop resume --otp <123456>`
 
 Notes:
 
@@ -85,23 +85,23 @@ Notes:
 
 ### `service`
 
-- `zeroclaw service install`
-- `zeroclaw service start`
-- `zeroclaw service stop`
-- `zeroclaw service restart`
-- `zeroclaw service status`
-- `zeroclaw service uninstall`
+- `freeclaw service install`
+- `freeclaw service start`
+- `freeclaw service stop`
+- `freeclaw service restart`
+- `freeclaw service status`
+- `freeclaw service uninstall`
 
 ### `cron`
 
-- `zeroclaw cron list`
-- `zeroclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `zeroclaw cron add-at <rfc3339_timestamp> <command>`
-- `zeroclaw cron add-every <every_ms> <command>`
-- `zeroclaw cron once <delay> <command>`
-- `zeroclaw cron remove <id>`
-- `zeroclaw cron pause <id>`
-- `zeroclaw cron resume <id>`
+- `freeclaw cron list`
+- `freeclaw cron add <expr> [--tz <IANA_TZ>] <command>`
+- `freeclaw cron add-at <rfc3339_timestamp> <command>`
+- `freeclaw cron add-every <every_ms> <command>`
+- `freeclaw cron once <delay> <command>`
+- `freeclaw cron remove <id>`
+- `freeclaw cron pause <id>`
+- `freeclaw cron resume <id>`
 
 Notes:
 
@@ -110,29 +110,29 @@ Notes:
 
 ### `models`
 
-- `zeroclaw models refresh`
-- `zeroclaw models refresh --provider <ID>`
-- `zeroclaw models refresh --force`
+- `freeclaw models refresh`
+- `freeclaw models refresh --provider <ID>`
+- `freeclaw models refresh --force`
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
 ### `doctor`
 
-- `zeroclaw doctor`
-- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
-- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
-- `zeroclaw doctor traces --id <TRACE_ID>`
+- `freeclaw doctor`
+- `freeclaw doctor models [--provider <ID>] [--use-cache]`
+- `freeclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `freeclaw doctor traces --id <TRACE_ID>`
 
 `doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`
 
-- `zeroclaw channel list`
-- `zeroclaw channel start`
-- `zeroclaw channel doctor`
-- `zeroclaw channel bind-telegram <IDENTITY>`
-- `zeroclaw channel add <type> <json>`
-- `zeroclaw channel remove <name>`
+- `freeclaw channel list`
+- `freeclaw channel start`
+- `freeclaw channel doctor`
+- `freeclaw channel bind-telegram <IDENTITY>`
+- `freeclaw channel add <type> <json>`
+- `freeclaw channel remove <name>`
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
@@ -153,14 +153,14 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 ### `integrations`
 
-- `zeroclaw integrations info <name>`
+- `freeclaw integrations info <name>`
 
 ### `skills`
 
-- `zeroclaw skills list`
-- `zeroclaw skills audit <source_or_name>`
-- `zeroclaw skills install <source>`
-- `zeroclaw skills remove <name>`
+- `freeclaw skills list`
+- `freeclaw skills audit <source_or_name>`
+- `freeclaw skills install <source>`
+- `freeclaw skills remove <name>`
 
 `<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
 
@@ -176,43 +176,43 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `freeclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 
-- `zeroclaw config schema`
+- `freeclaw config schema`
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
 
 ### `completions`
 
-- `zeroclaw completions bash`
-- `zeroclaw completions fish`
-- `zeroclaw completions zsh`
-- `zeroclaw completions powershell`
-- `zeroclaw completions elvish`
+- `freeclaw completions bash`
+- `freeclaw completions fish`
+- `freeclaw completions zsh`
+- `freeclaw completions powershell`
+- `freeclaw completions elvish`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
 
 ### `hardware`
 
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
+- `freeclaw hardware discover`
+- `freeclaw hardware introspect <path>`
+- `freeclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
 
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
+- `freeclaw peripheral list`
+- `freeclaw peripheral add <board> <path>`
+- `freeclaw peripheral flash [--port <serial_port>]`
+- `freeclaw peripheral setup-uno-q [--host <ip_or_host>]`
+- `freeclaw peripheral flash-nucleo`
 
 ## Validation Tip
 
 To verify docs against your current binary quickly:
 
 ```bash
-zeroclaw --help
-zeroclaw <command> --help
+freeclaw --help
+freeclaw <command> --help
 ```

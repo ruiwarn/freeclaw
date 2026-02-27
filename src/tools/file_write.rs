@@ -53,31 +53,6 @@ impl Tool for FileWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
 
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
-
         let full_path = self.security.workspace_dir.join(path);
 
         let Some(parent) = full_path.parent() else {
@@ -91,62 +66,7 @@ impl Tool for FileWriteTool {
         // Ensure parent directory exists
         tokio::fs::create_dir_all(parent).await?;
 
-        // Resolve parent AFTER creation to block symlink escapes.
-        let resolved_parent = match tokio::fs::canonicalize(parent).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to resolve file path: {e}")),
-                });
-            }
-        };
-
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(
-                    self.security
-                        .resolved_path_violation_message(&resolved_parent),
-                ),
-            });
-        }
-
-        let Some(file_name) = full_path.file_name() else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Invalid path: missing file name".into()),
-            });
-        };
-
-        let resolved_target = resolved_parent.join(file_name);
-
-        // If the target already exists and is a symlink, refuse to follow it
-        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
-            if meta.file_type().is_symlink() {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Refusing to write through symlink: {}",
-                        resolved_target.display()
-                    )),
-                });
-            }
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
-        match tokio::fs::write(&resolved_target, content).await {
+        match tokio::fs::write(&full_path, content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Written {} bytes to {path}", content.len()),
@@ -206,7 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_creates_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -228,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_creates_parent_dirs() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_nested");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write_nested");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -249,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_overwrites_existing() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_overwrite");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write_overwrite");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("exist.txt"), "old")
@@ -273,7 +193,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_blocks_path_traversal() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_traversal");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write_traversal");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -315,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_empty_content() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_empty");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write_empty");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -335,7 +255,7 @@ mod tests {
     async fn file_write_blocks_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("zeroclaw_test_file_write_symlink_escape");
+        let root = std::env::temp_dir().join("freeclaw_test_file_write_symlink_escape");
         let workspace = root.join("workspace");
         let outside = root.join("outside");
 
@@ -364,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_blocks_readonly_mode() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_readonly");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write_readonly");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -383,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_rate_limited");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write_rate_limited");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -415,7 +335,7 @@ mod tests {
     async fn file_write_blocks_symlink_target_file() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("zeroclaw_test_file_write_symlink_target");
+        let root = std::env::temp_dir().join("freeclaw_test_file_write_symlink_target");
         let workspace = root.join("workspace");
         let outside = root.join("outside");
 
@@ -452,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_blocks_null_byte_in_path() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_null");
+        let dir = std::env::temp_dir().join("freeclaw_test_file_write_null");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 

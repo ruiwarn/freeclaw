@@ -1,4 +1,4 @@
-const TOKEN_KEY = 'zeroclaw_token';
+const TOKEN_KEY = 'freeclaw_token';
 
 /**
  * Retrieve the stored authentication token.

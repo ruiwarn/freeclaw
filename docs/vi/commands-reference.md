@@ -1,6 +1,6 @@
-# Tham khảo lệnh ZeroClaw
+# Tham khảo lệnh FreeClaw
 
-Dựa trên CLI hiện tại (`zeroclaw --help`).
+Dựa trên CLI hiện tại (`freeclaw --help`).
 
 Xác minh lần cuối: **2026-02-20**.
 
@@ -31,60 +31,60 @@ Xác minh lần cuối: **2026-02-20**.
 
 ### `onboard`
 
-- `zeroclaw onboard`
-- `zeroclaw onboard --interactive`
-- `zeroclaw onboard --channels-only`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `freeclaw onboard`
+- `freeclaw onboard --interactive`
+- `freeclaw onboard --channels-only`
+- `freeclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `freeclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
 
 ### `agent`
 
-- `zeroclaw agent`
-- `zeroclaw agent -m "Hello"`
-- `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
+- `freeclaw agent`
+- `freeclaw agent -m "Hello"`
+- `freeclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
+- `freeclaw agent --peripheral <board:path>`
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
-- `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+- `freeclaw gateway [--host <HOST>] [--port <PORT>]`
+- `freeclaw daemon [--host <HOST>] [--port <PORT>]`
 
 ### `service`
 
-- `zeroclaw service install`
-- `zeroclaw service start`
-- `zeroclaw service stop`
-- `zeroclaw service restart`
-- `zeroclaw service status`
-- `zeroclaw service uninstall`
+- `freeclaw service install`
+- `freeclaw service start`
+- `freeclaw service stop`
+- `freeclaw service restart`
+- `freeclaw service status`
+- `freeclaw service uninstall`
 
 ### `cron`
 
-- `zeroclaw cron list`
-- `zeroclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `zeroclaw cron add-at <rfc3339_timestamp> <command>`
-- `zeroclaw cron add-every <every_ms> <command>`
-- `zeroclaw cron once <delay> <command>`
-- `zeroclaw cron remove <id>`
-- `zeroclaw cron pause <id>`
-- `zeroclaw cron resume <id>`
+- `freeclaw cron list`
+- `freeclaw cron add <expr> [--tz <IANA_TZ>] <command>`
+- `freeclaw cron add-at <rfc3339_timestamp> <command>`
+- `freeclaw cron add-every <every_ms> <command>`
+- `freeclaw cron once <delay> <command>`
+- `freeclaw cron remove <id>`
+- `freeclaw cron pause <id>`
+- `freeclaw cron resume <id>`
 
 ### `models`
 
-- `zeroclaw models refresh`
-- `zeroclaw models refresh --provider <ID>`
-- `zeroclaw models refresh --force`
+- `freeclaw models refresh`
+- `freeclaw models refresh --provider <ID>`
+- `freeclaw models refresh --force`
 
 `models refresh` hiện hỗ trợ làm mới danh mục trực tiếp cho các provider: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen` và `nvidia`.
 
 ### `channel`
 
-- `zeroclaw channel list`
-- `zeroclaw channel start`
-- `zeroclaw channel doctor`
-- `zeroclaw channel bind-telegram <IDENTITY>`
-- `zeroclaw channel add <type> <json>`
-- `zeroclaw channel remove <name>`
+- `freeclaw channel list`
+- `freeclaw channel start`
+- `freeclaw channel doctor`
+- `freeclaw channel bind-telegram <IDENTITY>`
+- `freeclaw channel add <type> <json>`
+- `freeclaw channel remove <name>`
 
 Lệnh trong chat khi runtime đang chạy (Telegram/Discord):
 
@@ -104,13 +104,13 @@ Channel runtime cũng theo dõi `config.toml` và tự động áp dụng thay �
 
 ### `integrations`
 
-- `zeroclaw integrations info <name>`
+- `freeclaw integrations info <name>`
 
 ### `skills`
 
-- `zeroclaw skills list`
-- `zeroclaw skills install <source>`
-- `zeroclaw skills remove <name>`
+- `freeclaw skills list`
+- `freeclaw skills install <source>`
+- `freeclaw skills remove <name>`
 
 `<source>` chấp nhận git remote (`https://...`, `http://...`, `ssh://...` và `git@host:owner/repo.git`) hoặc đường dẫn cục bộ.
 
@@ -118,43 +118,43 @@ Skill manifest (`SKILL.toml`) hỗ trợ `prompts` và `[[tools]]`; cả hai đ�
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `freeclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 
-- `zeroclaw config schema`
+- `freeclaw config schema`
 
 `config schema` xuất JSON Schema (draft 2020-12) cho toàn bộ hợp đồng `config.toml` ra stdout.
 
 ### `completions`
 
-- `zeroclaw completions bash`
-- `zeroclaw completions fish`
-- `zeroclaw completions zsh`
-- `zeroclaw completions powershell`
-- `zeroclaw completions elvish`
+- `freeclaw completions bash`
+- `freeclaw completions fish`
+- `freeclaw completions zsh`
+- `freeclaw completions powershell`
+- `freeclaw completions elvish`
 
 `completions` chỉ xuất ra stdout để script có thể được source trực tiếp mà không bị lẫn log/cảnh báo.
 
 ### `hardware`
 
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
+- `freeclaw hardware discover`
+- `freeclaw hardware introspect <path>`
+- `freeclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
 
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
+- `freeclaw peripheral list`
+- `freeclaw peripheral add <board> <path>`
+- `freeclaw peripheral flash [--port <serial_port>]`
+- `freeclaw peripheral setup-uno-q [--host <ip_or_host>]`
+- `freeclaw peripheral flash-nucleo`
 
 ## Kiểm tra nhanh
 
 Để xác minh nhanh tài liệu với binary hiện tại:
 
 ```bash
-zeroclaw --help
-zeroclaw <command> --help
+freeclaw --help
+freeclaw <command> --help
 ```

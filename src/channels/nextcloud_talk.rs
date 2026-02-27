@@ -121,7 +121,7 @@ impl NextcloudTalkChannel {
             tracing::warn!(
                 "Nextcloud Talk: ignoring message from unauthorized actor: {actor_id}. \
                 Add to channels.nextcloud_talk.allowed_users in config.toml, \
-                or run `zeroclaw onboard --channels-only` to configure interactively."
+                or run `freeclaw onboard --channels-only` to configure interactively."
             );
             return messages;
         }
@@ -429,7 +429,7 @@ mod tests {
             "message": {
                 "actorType": "users",
                 "actorId": "user_a",
-                "timestamp": 1735701200123u64,
+                "timestamp": 1_735_701_200_123_u64,
                 "message": "hello"
             }
         });

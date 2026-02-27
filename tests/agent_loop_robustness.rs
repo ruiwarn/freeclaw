@@ -9,16 +9,16 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use freeclaw::agent::agent::Agent;
+use freeclaw::agent::dispatcher::NativeToolDispatcher;
+use freeclaw::config::MemoryConfig;
+use freeclaw::memory;
+use freeclaw::memory::Memory;
+use freeclaw::observability::{NoopObserver, Observer};
+use freeclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
+use freeclaw::tools::{Tool, ToolResult};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use zeroclaw::agent::agent::Agent;
-use zeroclaw::agent::dispatcher::NativeToolDispatcher;
-use zeroclaw::config::MemoryConfig;
-use zeroclaw::memory;
-use zeroclaw::memory::Memory;
-use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
-use zeroclaw::tools::{Tool, ToolResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock infrastructure

@@ -13,19 +13,19 @@ For first-time setup and quick orientation.
 
 | Scenario | Command |
 |----------|---------|
-| I have an API key, want fastest setup | `zeroclaw onboard --api-key sk-... --provider openrouter` |
-| I want guided prompts | `zeroclaw onboard --interactive` |
-| Config exists, just fix channels | `zeroclaw onboard --channels-only` |
-| Config exists, I intentionally want full overwrite | `zeroclaw onboard --force` |
+| I have an API key, want fastest setup | `freeclaw onboard --api-key sk-... --provider openrouter` |
+| I want guided prompts | `freeclaw onboard --interactive` |
+| Config exists, just fix channels | `freeclaw onboard --channels-only` |
+| Config exists, I intentionally want full overwrite | `freeclaw onboard --force` |
 | Using subscription auth | See [Subscription Auth](../../README.md#subscription-auth-openai-codex--claude-code) |
 
 ## Onboarding and Validation
 
-- Quick onboarding: `zeroclaw onboard --api-key "sk-..." --provider openrouter`
-- Interactive onboarding: `zeroclaw onboard --interactive`
+- Quick onboarding: `freeclaw onboard --api-key "sk-..." --provider openrouter`
+- Interactive onboarding: `freeclaw onboard --interactive`
 - Existing config protection: reruns require explicit confirmation (or `--force` in non-interactive flows)
 - Ollama cloud models (`:cloud`) require a remote `api_url` and API key (for example `api_url = "https://ollama.com"`).
-- Validate environment: `zeroclaw status` + `zeroclaw doctor`
+- Validate environment: `freeclaw status` + `freeclaw doctor`
 
 ## Next
 

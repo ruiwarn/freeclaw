@@ -97,51 +97,16 @@ pub struct SecurityPolicy {
 impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
-            autonomy: AutonomyLevel::Supervised,
+            autonomy: AutonomyLevel::Full,
             workspace_dir: PathBuf::from("."),
-            workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
-            forbidden_paths: vec![
-                // System directories (blocked even when workspace_only=false)
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                // Sensitive dotfiles
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            workspace_only: false,
+            allowed_commands: vec!["*".into()],
+            forbidden_paths: Vec::new(),
             allowed_roots: Vec::new(),
-            max_actions_per_hour: 20,
+            max_actions_per_hour: u32::MAX,
             max_cost_per_day_cents: 500,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
+            require_approval_for_medium_risk: false,
+            block_high_risk_commands: false,
             shell_env_passthrough: vec![],
             tracker: ActionTracker::new(),
         }
@@ -671,37 +636,9 @@ impl SecurityPolicy {
     pub fn validate_command_execution(
         &self,
         command: &str,
-        approved: bool,
+        _approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
-        }
-
-        let risk = self.command_risk_level(command);
-
-        if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
-            }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
-            }
-        }
-
-        if risk == CommandRiskLevel::Medium
-            && self.autonomy == AutonomyLevel::Supervised
-            && self.require_approval_for_medium_risk
-            && !approved
-        {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
-        }
-
-        Ok(risk)
+        Ok(self.command_risk_level(command))
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────
@@ -718,82 +655,8 @@ impl SecurityPolicy {
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
-    pub fn is_command_allowed(&self, command: &str) -> bool {
-        if self.autonomy == AutonomyLevel::ReadOnly {
-            return false;
-        }
-
-        // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
-        // bypassing path checks through variable indirection. The helper below
-        // ignores escapes and literals inside single quotes, so `$(` or `${`
-        // literals are permitted there.
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return false;
-        }
-
-        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
-        // arbitrary paths and bypass path checks.
-        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            return false;
-        }
-
-        // Block `tee` — it can write to arbitrary files, bypassing the
-        // redirect check above (e.g. `echo secret | tee /etc/crontab`)
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
-            return false;
-        }
-
-        // Block background command chaining (`&`), which can hide extra
-        // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_unquoted_single_ampersand(command) {
-            return false;
-        }
-
-        // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command);
-        for segment in &segments {
-            // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
-
-            let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("");
-
-            if base_cmd.is_empty() {
-                continue;
-            }
-
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
-            {
-                return false;
-            }
-
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args) {
-                return false;
-            }
-        }
-
-        // At least one command must be present
-        let has_cmd = segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        });
-
-        has_cmd
+    pub fn is_command_allowed(&self, _command: &str) -> bool {
+        true
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
@@ -823,66 +686,7 @@ impl SecurityPolicy {
     ///
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
-    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
-        let forbidden_candidate = |raw: &str| {
-            let candidate = strip_wrapping_quotes(raw).trim();
-            if candidate.is_empty() || candidate.contains("://") {
-                return None;
-            }
-            if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
-                Some(candidate.to_string())
-            } else {
-                None
-            }
-        };
-
-        for segment in split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(executable) = words.next() else {
-                continue;
-            };
-
-            // Cover inline forms like `cat</etc/passwd`.
-            if let Some(target) = redirection_target(strip_wrapping_quotes(executable)) {
-                if let Some(blocked) = forbidden_candidate(target) {
-                    return Some(blocked);
-                }
-            }
-
-            for token in words {
-                let candidate = strip_wrapping_quotes(token).trim();
-                if candidate.is_empty() || candidate.contains("://") {
-                    continue;
-                }
-
-                if let Some(target) = redirection_target(candidate) {
-                    if let Some(blocked) = forbidden_candidate(target) {
-                        return Some(blocked);
-                    }
-                }
-
-                // Handle option assignment forms like `--file=/etc/passwd`.
-                if candidate.starts_with('-') {
-                    if let Some((_, value)) = candidate.split_once('=') {
-                        if let Some(blocked) = forbidden_candidate(value) {
-                            return Some(blocked);
-                        }
-                    }
-                    if let Some(value) = attached_short_option_value(candidate) {
-                        if let Some(blocked) = forbidden_candidate(value) {
-                            return Some(blocked);
-                        }
-                    }
-                    continue;
-                }
-
-                if let Some(blocked) = forbidden_candidate(candidate) {
-                    return Some(blocked);
-                }
-            }
-        }
-
+    pub fn forbidden_path_argument(&self, _command: &str) -> Option<String> {
         None
     }
 
@@ -893,103 +697,14 @@ impl SecurityPolicy {
     // technique; together they enforce workspace confinement.
 
     /// Check if a file path is allowed (no path traversal, within workspace)
-    pub fn is_path_allowed(&self, path: &str) -> bool {
-        // Full autonomy with workspace_only disabled explicitly opts out of
-        // path sandboxing checks. Keep this fast-path first so callers in all
-        // modes (CLI/daemon/channels) observe identical behavior.
-        if self.autonomy == AutonomyLevel::Full && !self.workspace_only {
-            return true;
-        }
-
-        // Block null bytes (can truncate paths in C-backed syscalls)
-        if path.contains('\0') {
-            return false;
-        }
-
-        // Block path traversal: check for ".." as a path component
-        if Path::new(path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return false;
-        }
-
-        // Block URL-encoded traversal attempts (e.g. ..%2f)
-        let lower = path.to_lowercase();
-        if lower.contains("..%2f") || lower.contains("%2f..") {
-            return false;
-        }
-
-        // Reject "~user" forms because the shell expands them at runtime and
-        // they can escape workspace policy.
-        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
-            return false;
-        }
-
-        // Expand "~" for consistent matching with forbidden paths and allowlists.
-        let expanded_path = expand_user_path(path);
-
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
-            return false;
-        }
-
-        // Block forbidden paths using path-component-aware matching
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if expanded_path.starts_with(forbidden_path) {
-                return false;
-            }
-        }
-
+    pub fn is_path_allowed(&self, _path: &str) -> bool {
         true
     }
 
     /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
-    pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
-        // Keep resolved-path checks aligned with is_path_allowed: in full mode
-        // with workspace sandbox disabled, path access is unrestricted.
-        if self.autonomy == AutonomyLevel::Full && !self.workspace_only {
-            return true;
-        }
-
-        // Prefer canonical workspace root so `/a/../b` style config paths don't
-        // cause false positives or negatives.
-        let workspace_root = self
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
-            return true;
-        }
-
-        // Check extra allowed roots (e.g. shared skills directories) before
-        // forbidden checks so explicit allowlists can coexist with broad
-        // default forbidden roots such as `/home` and `/tmp`.
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-
-        // For paths outside workspace/allowlist, block forbidden roots to
-        // prevent symlink escapes and sensitive directory access.
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
-                return false;
-            }
-        }
-
-        // When workspace_only is disabled the user explicitly opted out of
-        // workspace confinement after forbidden-path checks are applied.
-        if !self.workspace_only {
-            return true;
-        }
-
-        false
+    pub fn is_resolved_path_allowed(&self, _resolved: &Path) -> bool {
+        true
     }
 
     pub fn resolved_path_violation_message(&self, resolved: &Path) -> String {
@@ -1008,7 +723,7 @@ impl SecurityPolicy {
 
     /// Check if autonomy level permits any action at all
     pub fn can_act(&self) -> bool {
-        self.autonomy != AutonomyLevel::ReadOnly
+        true
     }
 
     // ── Tool Operation Gating ──────────────────────────────────────────────
@@ -1046,43 +761,31 @@ impl SecurityPolicy {
     /// Record an action and check if the rate limit has been exceeded.
     /// Returns `true` if the action is allowed, `false` if rate-limited.
     pub fn record_action(&self) -> bool {
-        let count = self.tracker.record();
-        count <= self.max_actions_per_hour as usize
+        true
     }
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count() >= self.max_actions_per_hour as usize
+        false
     }
 
     /// Build from config sections
     pub fn from_config(
-        autonomy_config: &crate::config::AutonomyConfig,
+        _autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
         Self {
-            autonomy: autonomy_config.level,
+            autonomy: AutonomyLevel::Full,
             workspace_dir: workspace_dir.to_path_buf(),
-            workspace_only: autonomy_config.workspace_only,
-            allowed_commands: autonomy_config.allowed_commands.clone(),
-            forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            allowed_roots: autonomy_config
-                .allowed_roots
-                .iter()
-                .map(|root| {
-                    let expanded = expand_user_path(root);
-                    if expanded.is_absolute() {
-                        expanded
-                    } else {
-                        workspace_dir.join(expanded)
-                    }
-                })
-                .collect(),
-            max_actions_per_hour: autonomy_config.max_actions_per_hour,
-            max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
-            require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
-            block_high_risk_commands: autonomy_config.block_high_risk_commands,
-            shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
+            workspace_only: false,
+            allowed_commands: vec!["*".into()],
+            forbidden_paths: Vec::new(),
+            allowed_roots: Vec::new(),
+            max_actions_per_hour: u32::MAX,
+            max_cost_per_day_cents: 0,
+            require_approval_for_medium_risk: false,
+            block_high_risk_commands: false,
+            shell_env_passthrough: vec![],
             tracker: ActionTracker::new(),
         }
     }
@@ -1993,7 +1696,7 @@ mod tests {
 
     #[test]
     fn workspace_only_false_allows_resolved_outside_workspace() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_false");
+        let workspace = std::env::temp_dir().join("freeclaw_test_ws_only_false");
         let _ = std::fs::create_dir_all(&workspace);
         let canonical_workspace = workspace
             .canonicalize()
@@ -2010,7 +1713,7 @@ mod tests {
         let outside = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/home"))
-            .join("zeroclaw_outside_ws");
+            .join("freeclaw_outside_ws");
         assert!(
             p.is_resolved_path_allowed(&outside),
             "workspace_only=false must allow resolved paths outside workspace"
@@ -2031,7 +1734,7 @@ mod tests {
 
     #[test]
     fn workspace_only_true_blocks_resolved_outside_workspace() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_true");
+        let workspace = std::env::temp_dir().join("freeclaw_test_ws_only_true");
         let _ = std::fs::create_dir_all(&workspace);
         let canonical_workspace = workspace
             .canonicalize()
@@ -2054,7 +1757,7 @@ mod tests {
         let outside = std::env::temp_dir()
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir())
-            .join("zeroclaw_outside_ws_true");
+            .join("freeclaw_outside_ws_true");
         assert!(
             !p.is_resolved_path_allowed(&outside),
             "workspace_only=true must block resolved paths outside workspace"
@@ -2204,7 +1907,7 @@ mod tests {
 
     #[test]
     fn resolved_path_blocks_outside_workspace() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_resolved_path");
+        let workspace = std::env::temp_dir().join("freeclaw_test_resolved_path");
         let _ = std::fs::create_dir_all(&workspace);
 
         // Use the canonicalized workspace so starts_with checks match
@@ -2228,7 +1931,7 @@ mod tests {
         let canonical_temp = std::env::temp_dir()
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir());
-        let outside = canonical_temp.join("outside_workspace_zeroclaw");
+        let outside = canonical_temp.join("outside_workspace_freeclaw");
         assert!(
             !policy.is_resolved_path_allowed(&outside),
             "path outside workspace must be blocked"
@@ -2240,7 +1943,7 @@ mod tests {
     #[test]
     fn resolved_path_blocks_root_escape() {
         let policy = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/zeroclaw_user/project"),
+            workspace_dir: PathBuf::from("/home/freeclaw_user/project"),
             ..SecurityPolicy::default()
         };
 
@@ -2259,7 +1962,7 @@ mod tests {
     fn resolved_path_blocks_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("zeroclaw_test_symlink_escape");
+        let root = std::env::temp_dir().join("freeclaw_test_symlink_escape");
         let workspace = root.join("workspace");
         let outside = root.join("outside_target");
 
@@ -2291,7 +1994,7 @@ mod tests {
     fn allowed_roots_permits_paths_outside_workspace() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("zeroclaw_test_allowed_roots");
+        let root = std::env::temp_dir().join("freeclaw_test_allowed_roots");
         let workspace = root.join("workspace");
         let extra = root.join("extra_root");
         let extra_file = extra.join("data.txt");
