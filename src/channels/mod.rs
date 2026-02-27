@@ -67,7 +67,10 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::{
+    build_tool_instructions, pending_approval_request_from_error, run_tool_call_loop,
+    scrub_credentials,
+};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -190,6 +193,119 @@ struct RuntimeConfigState {
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone)]
+struct PendingShellApproval {
+    command: String,
+}
+
+fn pending_shell_approval_store() -> &'static Mutex<HashMap<String, PendingShellApproval>> {
+    static STORE: OnceLock<Mutex<HashMap<String, PendingShellApproval>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_approval_reply(input: &str) -> String {
+    input
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !ch.is_ascii_punctuation())
+        .collect()
+}
+
+fn parse_approval_reply(input: &str) -> Option<bool> {
+    let normalized = normalize_approval_reply(input);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let deny_tokens = [
+        "n",
+        "no",
+        "deny",
+        "reject",
+        "cancel",
+        "stop",
+        "不同意",
+        "拒绝",
+        "取消",
+        "不执行",
+        "不可以",
+        "不行",
+        "否",
+    ];
+    if deny_tokens
+        .iter()
+        .any(|token| normalized == *token || normalized.contains(token))
+    {
+        return Some(false);
+    }
+
+    let allow_tokens = [
+        "y",
+        "yes",
+        "ok",
+        "okay",
+        "approve",
+        "allow",
+        "同意",
+        "确认",
+        "确认执行",
+        "允许",
+        "执行",
+        "可以",
+        "好",
+    ];
+    if allow_tokens
+        .iter()
+        .any(|token| normalized == *token || normalized.contains(token))
+    {
+        return Some(true);
+    }
+
+    None
+}
+
+fn render_shell_approval_prompt(command: &str) -> String {
+    format!(
+        "⚠️ 检测到高危命令，执行前需要你确认：\n```bash\n{command}\n```\n回复“同意 / yes”执行，回复“拒绝 / no”取消。"
+    )
+}
+
+async fn execute_pending_shell_command(
+    ctx: &ChannelRuntimeContext,
+    command: &str,
+) -> Result<String, String> {
+    let Some(shell_tool) = ctx
+        .tools_registry
+        .iter()
+        .find(|tool| tool.name() == "shell")
+    else {
+        return Err("shell 工具不可用，无法执行待确认命令。".to_string());
+    };
+
+    let result = shell_tool
+        .execute(serde_json::json!({
+            "command": command,
+            "approved": true,
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if result.success {
+        let output = truncate_with_ellipsis(&result.output, 2_000);
+        if output.trim().is_empty() {
+            Ok(format!("✅ 已执行命令：`{command}`"))
+        } else {
+            Ok(format!(
+                "✅ 已执行命令：`{command}`\n\n```text\n{output}\n```"
+            ))
+        }
+    } else {
+        let err = result.error.unwrap_or_else(|| "unknown error".to_string());
+        Err(format!("命令执行失败：{err}"))
+    }
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "freeclaw.service"];
@@ -1505,6 +1621,57 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+async fn maybe_handle_pending_shell_approval(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    history_key: &str,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    let pending = {
+        pending_shell_approval_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(history_key)
+            .cloned()
+    };
+    let Some(pending) = pending else {
+        return false;
+    };
+
+    let decision = parse_approval_reply(&msg.content);
+    let response = match decision {
+        Some(true) => {
+            pending_shell_approval_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(history_key);
+            match execute_pending_shell_command(ctx, &pending.command).await {
+                Ok(success_msg) => success_msg,
+                Err(err_msg) => format!("⚠️ {err_msg}"),
+            }
+        }
+        Some(false) => {
+            pending_shell_approval_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(history_key);
+            format!("已取消执行命令：`{}`", pending.command)
+        }
+        None => render_shell_approval_prompt(&pending.command),
+    };
+
+    append_sender_turn(ctx, history_key, ChatMessage::user(&msg.content));
+    append_sender_turn(ctx, history_key, ChatMessage::assistant(&response));
+
+    if let Some(channel) = target_channel {
+        let _ = channel
+            .send(&SendMessage::new(&response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .await;
+    }
+
+    true
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1558,6 +1725,18 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+    if msg.channel == "telegram"
+        && maybe_handle_pending_shell_approval(
+            ctx.as_ref(),
+            &msg,
+            &history_key,
+            target_channel.as_ref(),
+        )
+        .await
+    {
+        return;
+    }
+
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
@@ -1956,6 +2135,83 @@ async fn process_channel_message(
                 {
                     if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+                    }
+                }
+            } else if let Some(request) = pending_approval_request_from_error(&e) {
+                let command = request
+                    .arguments
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if request.tool_name.eq_ignore_ascii_case("shell") && !command.is_empty() {
+                    pending_shell_approval_store()
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .insert(
+                            history_key.clone(),
+                            PendingShellApproval {
+                                command: command.clone(),
+                            },
+                        );
+
+                    let approval_text = render_shell_approval_prompt(&command);
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant(&approval_text),
+                    );
+                    runtime_trace::record_event(
+                        "channel_message_pending_approval",
+                        Some(msg.channel.as_str()),
+                        Some(route.provider.as_str()),
+                        Some(route.model.as_str()),
+                        None,
+                        Some(true),
+                        None,
+                        serde_json::json!({
+                            "sender": msg.sender,
+                            "elapsed_ms": started_at.elapsed().as_millis(),
+                            "tool": request.tool_name,
+                            "command": command,
+                        }),
+                    );
+
+                    if let Some(channel) = target_channel.as_ref() {
+                        if let Some(ref draft_id) = draft_message_id {
+                            let _ = channel
+                                .finalize_draft(&msg.reply_target, draft_id, &approval_text)
+                                .await;
+                        } else {
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(&approval_text, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await;
+                        }
+                    }
+                } else {
+                    let error_text = "⚠️ 收到待确认命令请求，但命令参数无效。";
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant(error_text),
+                    );
+                    if let Some(channel) = target_channel.as_ref() {
+                        if let Some(ref draft_id) = draft_message_id {
+                            let _ = channel
+                                .finalize_draft(&msg.reply_target, draft_id, error_text)
+                                .await;
+                        } else {
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(error_text, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await;
+                        }
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
@@ -3346,6 +3602,17 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    #[test]
+    fn parse_approval_reply_supports_yes_and_no_variants() {
+        assert_eq!(parse_approval_reply("yes"), Some(true));
+        assert_eq!(parse_approval_reply("同意"), Some(true));
+        assert_eq!(parse_approval_reply("确认执行"), Some(true));
+        assert_eq!(parse_approval_reply("no"), Some(false));
+        assert_eq!(parse_approval_reply("拒绝"), Some(false));
+        assert_eq!(parse_approval_reply("不执行"), Some(false));
+        assert_eq!(parse_approval_reply("再说"), None);
     }
 
     #[test]

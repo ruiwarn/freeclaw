@@ -539,7 +539,13 @@ impl SecurityPolicy {
             // High-risk commands that are destructive or irreversible.
             if matches!(
                 base.as_str(),
-                "rm" | "mkfs" | "dd" | "shutdown" | "reboot" | "halt" | "poweroff" | "wipefs"
+                "rm" | "mkfs"
+                    | "dd"
+                    | "shutdown"
+                    | "reboot"
+                    | "halt"
+                    | "poweroff"
+                    | "wipefs"
                     | "shred"
             ) {
                 return CommandRiskLevel::High;

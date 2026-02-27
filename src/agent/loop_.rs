@@ -1858,6 +1858,45 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+const PENDING_APPROVAL_ERROR_PREFIX: &str = "__PENDING_APPROVAL__:";
+
+fn is_high_risk_shell_call(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    if !tool_name.eq_ignore_ascii_case("shell") {
+        return false;
+    }
+    let Some(command) = arguments.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    matches!(
+        crate::security::policy::SecurityPolicy::default().command_risk_level(command),
+        crate::security::policy::CommandRiskLevel::High
+    )
+}
+
+fn pending_approval_error(tool_name: &str, arguments: &serde_json::Value) -> anyhow::Error {
+    let payload = serde_json::json!({
+        "tool_name": tool_name,
+        "arguments": arguments,
+    });
+    anyhow::anyhow!("{PENDING_APPROVAL_ERROR_PREFIX}{payload}")
+}
+
+pub(crate) fn pending_approval_request_from_error(err: &anyhow::Error) -> Option<ApprovalRequest> {
+    let marker = err.chain().find_map(|source| {
+        source
+            .to_string()
+            .strip_prefix(PENDING_APPROVAL_ERROR_PREFIX)
+            .map(str::to_string)
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&marker).ok()?;
+    let tool_name = value.get("tool_name").and_then(|v| v.as_str())?.to_string();
+    let arguments = value.get("arguments")?.clone();
+    Some(ApprovalRequest {
+        tool_name,
+        arguments,
+    })
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -2444,6 +2483,10 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             // ── Approval hook ────────────────────────────────
+            if channel_name != "cli" && is_high_risk_shell_call(&tool_name, &tool_args) {
+                return Err(pending_approval_error(&tool_name, &tool_args));
+            }
+
             if let Some(mgr) = approval {
                 if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
@@ -3414,6 +3457,23 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+    }
+
+    #[test]
+    fn pending_approval_error_round_trip() {
+        let err = pending_approval_error(
+            "shell",
+            &serde_json::json!({
+                "command": "rm -rf /tmp/demo",
+            }),
+        );
+        let req = pending_approval_request_from_error(&err)
+            .expect("pending approval payload should parse");
+        assert_eq!(req.tool_name, "shell");
+        assert_eq!(
+            req.arguments.get("command").and_then(|v| v.as_str()),
+            Some("rm -rf /tmp/demo")
+        );
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
