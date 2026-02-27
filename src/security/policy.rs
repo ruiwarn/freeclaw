@@ -536,37 +536,11 @@ impl SecurityPolicy {
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
-            // High-risk commands
+            // High-risk commands that are destructive or irreversible.
             if matches!(
                 base.as_str(),
-                "rm" | "mkfs"
-                    | "dd"
-                    | "shutdown"
-                    | "reboot"
-                    | "halt"
-                    | "poweroff"
-                    | "sudo"
-                    | "su"
-                    | "chown"
-                    | "chmod"
-                    | "useradd"
-                    | "userdel"
-                    | "usermod"
-                    | "passwd"
-                    | "mount"
-                    | "umount"
-                    | "iptables"
-                    | "ufw"
-                    | "firewall-cmd"
-                    | "curl"
-                    | "wget"
-                    | "nc"
-                    | "ncat"
-                    | "netcat"
-                    | "scp"
-                    | "ssh"
-                    | "ftp"
-                    | "telnet"
+                "rm" | "mkfs" | "dd" | "shutdown" | "reboot" | "halt" | "poweroff" | "wipefs"
+                    | "shred"
             ) {
                 return CommandRiskLevel::High;
             }
@@ -636,9 +610,16 @@ impl SecurityPolicy {
     pub fn validate_command_execution(
         &self,
         command: &str,
-        _approved: bool,
+        approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        Ok(self.command_risk_level(command))
+        let risk = self.command_risk_level(command);
+        if matches!(risk, CommandRiskLevel::High) && !approved {
+            return Err(
+                "High-risk command requires explicit approval. Re-run with `approved: true`."
+                    .to_string(),
+            );
+        }
+        Ok(risk)
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────

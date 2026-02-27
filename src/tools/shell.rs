@@ -87,6 +87,18 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+        let approved = args
+            .get("approved")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if let Err(reason) = self.security.validate_command_execution(command, approved) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
+            });
+        }
 
         let mut cmd = match self
             .runtime
@@ -442,17 +454,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_requires_approval_for_medium_risk_command() {
+    async fn shell_requires_approval_for_high_risk_command() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into()],
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
 
         let tool = ShellTool::new(security.clone(), test_runtime());
+        let test_path = std::env::temp_dir().join("freeclaw_shell_approval_test");
+        let _ = tokio::fs::write(&test_path, "approval-test").await;
+        let rm_cmd = format!("rm -f {}", test_path.display());
         let denied = tool
-            .execute(json!({"command": "touch freeclaw_shell_approval_test"}))
+            .execute(json!({"command": rm_cmd.clone()}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -464,15 +478,14 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch freeclaw_shell_approval_test",
+                "command": rm_cmd,
                 "approved": true
             }))
             .await
             .expect("approved command execution should succeed");
         assert!(allowed.success);
 
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("freeclaw_shell_approval_test")).await;
+        assert!(!test_path.exists());
     }
 
     // ── §5.2 Shell timeout enforcement tests ─────────────────
