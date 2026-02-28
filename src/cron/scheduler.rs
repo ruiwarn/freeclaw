@@ -172,7 +172,7 @@ async fn run_agent_job(
                 Some(prefixed_prompt),
                 None,
                 model_override,
-                config.default_temperature,
+                config.default_temperature.unwrap_or(f64::NAN),
                 vec![],
                 false,
             )

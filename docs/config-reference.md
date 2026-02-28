@@ -177,13 +177,17 @@ temperature = 0.2
 
 | Key | Default | Purpose |
 |---|---|---|
-| `reasoning_enabled` | unset (`None`) | Global reasoning/thinking override for providers that support explicit controls |
+| `reasoning_enabled` | `true` | Global reasoning/thinking override for providers that support explicit controls |
 
 Notes:
 
-- `reasoning_enabled = false` explicitly disables provider-side reasoning for supported providers (currently `ollama`, via request field `think: false`).
-- `reasoning_enabled = true` explicitly requests reasoning for supported providers (`think: true` on `ollama`).
-- Unset keeps provider defaults.
+- `reasoning_enabled = false` explicitly disables provider-side reasoning for providers with explicit boolean toggles (for example `ollama` and DashScope/Qwen/Kimi-compatible endpoints).
+- `reasoning_enabled = true` explicitly requests reasoning on supported providers:
+  - `ollama`: `think: true`
+  - `anthropic` / `anthropic-custom:*`: `thinking: { type: "enabled", budget_tokens: 1024 }`
+  - `openai` / `openrouter`: `reasoning_effort: "high"`
+  - OpenAI-compatible providers: `enable_thinking: true` on DashScope/Qwen/Kimi-compatible endpoints, otherwise `reasoning_effort: "high"`
+- Default is enabled (`true`). Set `reasoning_enabled = false` to disable provider-side reasoning.
 
 ## `[skills]`
 

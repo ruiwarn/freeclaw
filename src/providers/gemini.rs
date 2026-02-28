@@ -141,6 +141,7 @@ struct Part {
 
 #[derive(Debug, Serialize, Clone)]
 struct GenerationConfig {
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,

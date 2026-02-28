@@ -37,6 +37,8 @@ pub struct OpenAiCompatibleProvider {
     /// Whether this provider supports OpenAI-style native tool calling.
     /// When false, tools are injected into the system prompt as text.
     native_tool_calling: bool,
+    /// Global runtime override for provider-side reasoning/thinking behavior.
+    reasoning_enabled: Option<bool>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -170,6 +172,47 @@ impl OpenAiCompatibleProvider {
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
+            reasoning_enabled: None,
+        }
+    }
+
+    pub fn with_reasoning(mut self, reasoning_enabled: Option<bool>) -> Self {
+        self.reasoning_enabled = reasoning_enabled;
+        self
+    }
+
+    fn supports_enable_thinking_flag(&self) -> bool {
+        let name = self.name.to_ascii_lowercase();
+        let base_url = self.base_url.to_ascii_lowercase();
+        name.contains("qwen")
+            || name.contains("kimi")
+            || base_url.contains("dashscope")
+            || base_url.contains("api.kimi.com")
+    }
+
+    fn apply_reasoning_override(&self, payload: &mut serde_json::Value) {
+        let Some(enabled) = self.reasoning_enabled else {
+            return;
+        };
+        let Some(map) = payload.as_object_mut() else {
+            return;
+        };
+
+        // DashScope/Qwen/Kimi-compatible endpoints expose explicit thinking switches.
+        if self.supports_enable_thinking_flag() {
+            map.insert(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(enabled),
+            );
+            return;
+        }
+
+        // For generic OpenAI-compatible endpoints, only inject on explicit enable.
+        if enabled {
+            map.insert(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String("high".to_string()),
+            );
         }
     }
 
@@ -310,6 +353,7 @@ impl OpenAiCompatibleProvider {
 struct ApiChatRequest {
     model: String,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -502,6 +546,7 @@ struct Function {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -1146,6 +1191,8 @@ impl Provider for OpenAiCompatibleProvider {
             tools: None,
             tool_choice: None,
         };
+        let mut payload = serde_json::to_value(&request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let url = self.chat_completions_url();
 
@@ -1161,7 +1208,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(self.http_client().post(&url).json(&payload), credential)
             .send()
             .await
         {
@@ -1268,10 +1315,12 @@ impl Provider for OpenAiCompatibleProvider {
             tools: None,
             tool_choice: None,
         };
+        let mut payload = serde_json::to_value(&request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(self.http_client().post(&url).json(&payload), credential)
             .send()
             .await
         {
@@ -1386,10 +1435,12 @@ impl Provider for OpenAiCompatibleProvider {
                 Some("auto".to_string())
             },
         };
+        let mut payload = serde_json::to_value(&request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .apply_auth_header(self.http_client().post(&url).json(&payload), credential)
             .send()
             .await
         {
@@ -1482,13 +1533,12 @@ impl Provider for OpenAiCompatibleProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
+        let mut payload = serde_json::to_value(&native_request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(
-                self.http_client().post(&url).json(&native_request),
-                credential,
-            )
+            .apply_auth_header(self.http_client().post(&url).json(&payload), credential)
             .send()
             .await
         {
@@ -1624,6 +1674,14 @@ impl Provider for OpenAiCompatibleProvider {
             tools: None,
             tool_choice: None,
         };
+        let mut payload = match serde_json::to_value(&request) {
+            Ok(value) => value,
+            Err(error) => {
+                return stream::once(async move { Err(StreamError::Provider(error.to_string())) })
+                    .boxed();
+            }
+        };
+        self.apply_reasoning_override(&mut payload);
 
         let url = self.chat_completions_url();
         let client = self.http_client();
@@ -1634,7 +1692,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         tokio::spawn(async move {
             // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = client.post(&url).json(&payload);
 
             // Apply auth header
             req_builder = match &auth_header {
@@ -1731,6 +1789,65 @@ mod tests {
     fn strips_trailing_slash() {
         let p = make_provider("test", "https://example.com/", None);
         assert_eq!(p.base_url, "https://example.com");
+    }
+
+    #[test]
+    fn reasoning_override_uses_enable_thinking_for_qwen_like_endpoints() {
+        let provider = OpenAiCompatibleProvider::new(
+            "Qwen",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        )
+        .with_reasoning(Some(true));
+        let mut payload = serde_json::json!({
+            "model": "qwen-plus",
+            "messages": [],
+            "temperature": 0.7
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert_eq!(
+            payload.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_override_uses_reasoning_effort_for_generic_compatible_endpoints() {
+        let provider =
+            make_provider("Venice", "https://api.venice.ai", Some("k")).with_reasoning(Some(true));
+        let mut payload = serde_json::json!({
+            "model": "venice-large",
+            "messages": [],
+            "temperature": 0.7
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&serde_json::Value::String("high".to_string()))
+        );
+        assert!(payload.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn reasoning_override_skips_for_generic_endpoints_when_disabled() {
+        let provider =
+            make_provider("Venice", "https://api.venice.ai", Some("k")).with_reasoning(Some(false));
+        let mut payload = serde_json::json!({
+            "model": "venice-large",
+            "messages": [],
+            "temperature": 0.7
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert!(payload.get("reasoning_effort").is_none());
+        assert!(payload.get("enable_thinking").is_none());
     }
 
     #[tokio::test]

@@ -120,13 +120,17 @@ temperature = 0.2
 
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
-| `reasoning_enabled` | chưa đặt (`None`) | Ghi đè toàn cục cho reasoning/thinking trên provider hỗ trợ |
+| `reasoning_enabled` | `true` | Ghi đè toàn cục cho reasoning/thinking trên provider hỗ trợ |
 
 Lưu ý:
 
-- `reasoning_enabled = false` tắt tường minh reasoning phía provider cho provider hỗ trợ (hiện tại `ollama`, qua trường `think: false`).
-- `reasoning_enabled = true` yêu cầu reasoning tường minh (`think: true` trên `ollama`).
-- Để trống giữ mặc định của provider.
+- `reasoning_enabled = false` tắt tường minh reasoning phía provider cho các provider có cờ bật/tắt boolean rõ ràng (ví dụ `ollama` và endpoint tương thích DashScope/Qwen/Kimi).
+- `reasoning_enabled = true` yêu cầu reasoning tường minh trên provider hỗ trợ:
+  - `ollama`: `think: true`
+  - `anthropic` / `anthropic-custom:*`: `thinking: { type: "enabled", budget_tokens: 1024 }`
+  - `openai` / `openrouter`: `reasoning_effort: "high"`
+  - Provider OpenAI-compatible: endpoint DashScope/Qwen/Kimi dùng `enable_thinking: true`, endpoint compatible khác dùng `reasoning_effort: "high"`
+- Mặc định đã bật (`true`). Đặt `reasoning_enabled = false` để tắt reasoning phía provider.
 
 ## `[skills]`
 

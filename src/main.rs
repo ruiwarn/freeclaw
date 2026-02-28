@@ -74,6 +74,7 @@ mod observability;
 mod onboard;
 mod peripherals;
 mod providers;
+mod priority_prompt;
 mod runtime;
 mod security;
 mod service;
@@ -187,9 +188,9 @@ Examples:
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
-        temperature: f64,
+        /// Temperature override (0.0 - 2.0); omit to use config/provider default
+        #[arg(short, long, value_parser = parse_temperature)]
+        temperature: Option<f64>,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
@@ -775,17 +776,21 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            peripheral,
-            true,
-        )
-        .await
-        .map(|_| ()),
+        } => {
+            let effective_temperature =
+                temperature.unwrap_or_else(|| config.default_temperature.unwrap_or(f64::NAN));
+            agent::run(
+                config,
+                message,
+                provider,
+                model,
+                effective_temperature,
+                peripheral,
+                true,
+            )
+            .await
+            .map(|_| ())
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);

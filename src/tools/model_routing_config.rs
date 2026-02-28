@@ -406,10 +406,10 @@ impl ModelRoutingConfigTool {
                 if !(0.0..=2.0).contains(&temperature) {
                     anyhow::bail!("'temperature' must be between 0.0 and 2.0");
                 }
-                cfg.default_temperature = temperature;
+                cfg.default_temperature = Some(temperature);
             }
             MaybeSet::Null => {
-                cfg.default_temperature = Config::default().default_temperature;
+                cfg.default_temperature = None;
             }
             MaybeSet::Unset => {}
         }
@@ -958,6 +958,24 @@ mod tests {
             output["config"]["default"]["temperature"].as_f64(),
             Some(0.2)
         );
+    }
+
+    #[tokio::test]
+    async fn set_default_allows_null_temperature() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "temperature": null
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(output["config"]["default"]["temperature"].is_null());
     }
 
     #[tokio::test]

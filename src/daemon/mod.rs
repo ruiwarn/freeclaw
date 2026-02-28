@@ -197,7 +197,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         for task in tasks {
             let prompt = format!("[Heartbeat Task] {task}");
-            let temp = config.default_temperature;
+            let temp = config.default_temperature.unwrap_or(f64::NAN);
             match crate::agent::run(
                 config.clone(),
                 Some(prompt),

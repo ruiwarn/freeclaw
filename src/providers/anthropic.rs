@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    reasoning_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -19,6 +20,7 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
 }
 
@@ -48,6 +50,7 @@ struct NativeChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<SystemPrompt>,
     messages: Vec<NativeMessage>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
@@ -155,6 +158,8 @@ struct NativeContentIn {
 }
 
 impl AnthropicProvider {
+    const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 1024;
+
     pub fn new(credential: Option<&str>) -> Self {
         Self::with_base_url(credential, None)
     }
@@ -170,6 +175,28 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            reasoning_enabled: None,
+        }
+    }
+
+    pub fn with_reasoning(mut self, reasoning_enabled: Option<bool>) -> Self {
+        self.reasoning_enabled = reasoning_enabled;
+        self
+    }
+
+    fn apply_reasoning_override(&self, payload: &mut serde_json::Value) {
+        if self.reasoning_enabled != Some(true) {
+            return;
+        }
+
+        if let Some(map) = payload.as_object_mut() {
+            map.insert(
+                "thinking".to_string(),
+                serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": Self::DEFAULT_THINKING_BUDGET_TOKENS
+                }),
+            );
         }
     }
 
@@ -446,13 +473,15 @@ impl Provider for AnthropicProvider {
             }],
             temperature,
         };
+        let mut payload = serde_json::to_value(&request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let mut request = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&request);
+            .json(&payload);
 
         request = self.apply_auth(request, credential);
 
@@ -493,13 +522,15 @@ impl Provider for AnthropicProvider {
             temperature,
             tools: Self::convert_tools(request.tools),
         };
+        let mut payload = serde_json::to_value(&native_request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let req = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&native_request);
+            .json(&payload);
 
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
@@ -629,6 +660,38 @@ mod tests {
     fn default_base_url_when_none_provided() {
         let p = AnthropicProvider::with_base_url(None, None);
         assert_eq!(p.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn reasoning_override_injects_thinking_when_enabled() {
+        let provider = AnthropicProvider::new(None).with_reasoning(Some(true));
+        let mut payload = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 4096
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert_eq!(
+            payload.get("thinking"),
+            Some(&serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": AnthropicProvider::DEFAULT_THINKING_BUDGET_TOKENS
+            }))
+        );
+    }
+
+    #[test]
+    fn reasoning_override_skips_thinking_when_disabled() {
+        let provider = AnthropicProvider::new(None).with_reasoning(Some(false));
+        let mut payload = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 4096
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert!(payload.get("thinking").is_none());
     }
 
     #[tokio::test]
@@ -1245,6 +1308,7 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
+            reasoning_enabled: None,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

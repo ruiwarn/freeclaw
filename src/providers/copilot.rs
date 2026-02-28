@@ -84,6 +84,7 @@ struct CachedApiKey {
 struct ApiChatRequest<'a> {
     model: String,
     messages: Vec<ApiMessage>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,

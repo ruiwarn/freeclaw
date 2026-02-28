@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
+    reasoning_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
 }
 
@@ -57,6 +59,7 @@ impl ResponseMessage {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
@@ -175,6 +178,24 @@ impl OpenAiProvider {
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
+            reasoning_enabled: None,
+        }
+    }
+
+    pub fn with_reasoning(mut self, reasoning_enabled: Option<bool>) -> Self {
+        self.reasoning_enabled = reasoning_enabled;
+        self
+    }
+
+    fn apply_reasoning_override(&self, payload: &mut serde_json::Value) {
+        if self.reasoning_enabled != Some(true) {
+            return;
+        }
+        if let Some(map) = payload.as_object_mut() {
+            map.insert(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String("high".to_string()),
+            );
         }
     }
 
@@ -327,12 +348,14 @@ impl Provider for OpenAiProvider {
             messages,
             temperature,
         };
+        let mut payload = serde_json::to_value(&request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let response = self
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
-            .json(&request)
+            .json(&payload)
             .send()
             .await?;
 
@@ -368,12 +391,14 @@ impl Provider for OpenAiProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
+        let mut payload = serde_json::to_value(&native_request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let response = self
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
+            .json(&payload)
             .send()
             .await?;
 
@@ -431,12 +456,14 @@ impl Provider for OpenAiProvider {
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
         };
+        let mut payload = serde_json::to_value(&native_request)?;
+        self.apply_reasoning_override(&mut payload);
 
         let response = self
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
+            .json(&payload)
             .send()
             .await?;
 
@@ -487,6 +514,29 @@ mod tests {
     fn creates_without_key() {
         let p = OpenAiProvider::new(None);
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn reasoning_override_sets_high_effort_when_enabled() {
+        let provider = OpenAiProvider::new(None).with_reasoning(Some(true));
+        let mut payload = serde_json::json!({"model":"gpt-5","messages":[],"temperature":0.7});
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&serde_json::Value::String("high".to_string()))
+        );
+    }
+
+    #[test]
+    fn reasoning_override_skips_when_disabled() {
+        let provider = OpenAiProvider::new(None).with_reasoning(Some(false));
+        let mut payload = serde_json::json!({"model":"gpt-5","messages":[],"temperature":0.7});
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -547,6 +597,39 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
         assert!(json.contains("\"temperature\":0.0"));
+    }
+
+    #[test]
+    fn request_omits_temperature_when_unset() {
+        let req = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            temperature: f64::NAN,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("temperature").is_none());
+    }
+
+    #[test]
+    fn native_request_omits_temperature_when_unset() {
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![NativeMessage {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }],
+            temperature: f64::NAN,
+            tools: None,
+            tool_choice: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("temperature").is_none());
     }
 
     #[test]

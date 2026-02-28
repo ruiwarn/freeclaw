@@ -40,14 +40,29 @@ Mỗi channel được bật bằng cách tạo sub-table tương ứng (ví d�
 
 Khi chạy `freeclaw channel start` (hoặc chế độ daemon), Telegram và Discord hỗ trợ chuyển đổi runtime theo phạm vi người gửi:
 
-- `/models` — hiển thị các provider hiện có và lựa chọn hiện tại
+- `/models` hoặc `/models list` — hiển thị các provider hiện có và lựa chọn hiện tại
+- `/models status` — chỉ hiển thị provider/model hiện tại
 - `/models <provider>` — chuyển provider cho phiên người gửi hiện tại
-- `/model` — hiển thị model hiện tại và các model ID đã cache (nếu có)
+- `/model` hoặc `/model list` — hiển thị model hiện tại và các model ID đã cache (nếu có)
+- `/model status` — chỉ hiển thị provider/model hiện tại
+- `/model <number>` — chuyển model theo số thứ tự trong danh sách cache
 - `/model <model-id>` — chuyển model cho phiên người gửi hiện tại
+- `/status` — hiển thị trạng thái runtime đầy đủ theo phiên người gửi (provider/model/default/memory/session/cache)
+- `/memory clean` — xem trước các bản ghi hội thoại tự lưu theo phạm vi người gửi có thể coi là nhiễu
+- `/memory clean current` — bí danh tường minh của `/memory clean`
+- `/memory clean confirm` — xóa các bản ghi đã xem trước từ lệnh `/memory clean`
+- `/memory clean current confirm` — bí danh tường minh của `/memory clean confirm`
+- `/memory clean all` — xem trước toàn bộ bản ghi memory ở mọi category/session
+- `/memory clean all confirm` — xóa toàn bộ bản ghi đã xem trước
+- `/new` — lưu lịch sử hội thoại hiện tại của người gửi rồi bắt đầu phiên mới
+- `/reset` — xóa lịch sử hội thoại hiện tại mà không lưu
 
 Lưu ý:
 
 - Việc chuyển đổi chỉ xóa lịch sử hội thoại trong bộ nhớ của người gửi đó, tránh ô nhiễm ngữ cảnh giữa các model.
+- `/memory clean` yêu cầu xác nhận rõ ràng bằng `/memory clean confirm` trước khi xóa.
+- `/memory clean all` yêu cầu xác nhận rõ ràng bằng `/memory clean all confirm` trước khi xóa.
+- `/new` và `/reset` không đổi provider/model, chỉ đổi trạng thái lịch sử hội thoại.
 - Xem trước bộ nhớ cache model từ `freeclaw models refresh --provider <ID>`.
 - Đây là lệnh chat runtime, không phải lệnh con CLI.
 

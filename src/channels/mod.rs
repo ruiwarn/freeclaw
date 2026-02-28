@@ -79,6 +79,7 @@ use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
+use crate::priority_prompt::ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -88,7 +89,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
@@ -102,7 +103,6 @@ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
-
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
 const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
@@ -153,8 +153,43 @@ enum ChannelRuntimeCommand {
     ShowProviders,
     SetProvider(String),
     ShowModel,
+    ShowStatus,
+    SetModelByIndex(usize),
     SetModel(String),
+    ShowMemoryHelp,
+    PrepareMemoryClean(MemoryCleanupScope),
+    ConfirmMemoryClean(MemoryCleanupScope),
     NewSession,
+    ResetSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryCleanupScope {
+    SenderConversation,
+    All,
+}
+
+impl MemoryCleanupScope {
+    fn preview_command(self) -> &'static str {
+        match self {
+            Self::SenderConversation => "/memory clean",
+            Self::All => "/memory clean all",
+        }
+    }
+
+    fn confirm_command(self) -> &'static str {
+        match self {
+            Self::SenderConversation => "/memory clean confirm",
+            Self::All => "/memory clean all confirm",
+        }
+    }
+
+    fn alias_confirm_command(self) -> Option<&'static str> {
+        match self {
+            Self::SenderConversation => Some("/memory clean current confirm"),
+            Self::All => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -202,6 +237,17 @@ struct PendingShellApproval {
 
 fn pending_shell_approval_store() -> &'static Mutex<HashMap<String, PendingShellApproval>> {
     static STORE: OnceLock<Mutex<HashMap<String, PendingShellApproval>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone)]
+struct PendingMemoryCleanup {
+    preview_count: usize,
+    scope: MemoryCleanupScope,
+}
+
+fn pending_memory_cleanup_store() -> &'static Mutex<HashMap<String, PendingMemoryCleanup>> {
+    static STORE: OnceLock<Mutex<HashMap<String, PendingMemoryCleanup>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -616,24 +662,72 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
+        "/status" => Some(ChannelRuntimeCommand::ShowStatus),
         "/models" => {
-            if let Some(provider) = parts.next() {
-                Some(ChannelRuntimeCommand::SetProvider(
-                    provider.trim().to_string(),
-                ))
-            } else {
+            let provider = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+            if provider.is_empty() || provider.eq_ignore_ascii_case("list") {
                 Some(ChannelRuntimeCommand::ShowProviders)
+            } else if provider.eq_ignore_ascii_case("status") {
+                Some(ChannelRuntimeCommand::ShowStatus)
+            } else {
+                Some(ChannelRuntimeCommand::SetProvider(provider))
             }
         }
         "/model" => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
+            } else if model.eq_ignore_ascii_case("list") {
+                Some(ChannelRuntimeCommand::ShowModel)
+            } else if model.eq_ignore_ascii_case("status") {
+                Some(ChannelRuntimeCommand::ShowStatus)
+            } else if let Ok(index) = model.trim_matches('`').parse::<usize>() {
+                Some(ChannelRuntimeCommand::SetModelByIndex(index))
             } else {
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/memory" => {
+            let args = parts
+                .map(|part| part.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            match args.as_slice() {
+                [] => Some(ChannelRuntimeCommand::ShowMemoryHelp),
+                [action] if action == "clean" => Some(ChannelRuntimeCommand::PrepareMemoryClean(
+                    MemoryCleanupScope::SenderConversation,
+                )),
+                [action, scope] if action == "clean" && scope == "current" => {
+                    Some(ChannelRuntimeCommand::PrepareMemoryClean(
+                        MemoryCleanupScope::SenderConversation,
+                    ))
+                }
+                [action, confirm] if action == "clean" && confirm == "confirm" => {
+                    Some(ChannelRuntimeCommand::ConfirmMemoryClean(
+                        MemoryCleanupScope::SenderConversation,
+                    ))
+                }
+                [action, scope, confirm]
+                    if action == "clean" && scope == "current" && confirm == "confirm" =>
+                {
+                    Some(ChannelRuntimeCommand::ConfirmMemoryClean(
+                        MemoryCleanupScope::SenderConversation,
+                    ))
+                }
+                [action, scope] if action == "clean" && scope == "all" => Some(
+                    ChannelRuntimeCommand::PrepareMemoryClean(MemoryCleanupScope::All),
+                ),
+                [action, scope, confirm]
+                    if action == "clean" && scope == "all" && confirm == "confirm" =>
+                {
+                    Some(ChannelRuntimeCommand::ConfirmMemoryClean(
+                        MemoryCleanupScope::All,
+                    ))
+                }
+                _ => Some(ChannelRuntimeCommand::ShowMemoryHelp),
+            }
+        }
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/reset" => Some(ChannelRuntimeCommand::ResetSession),
         _ => None,
     }
 }
@@ -677,7 +771,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
     ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
         model: resolved_default_model(config),
-        temperature: config.default_temperature,
+        temperature: config.default_temperature.unwrap_or(f64::NAN),
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
@@ -963,7 +1057,7 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
-fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
+fn load_cached_models(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
         return Vec::new();
@@ -976,14 +1070,304 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .entries
         .into_iter()
         .find(|entry| entry.provider == provider_name)
-        .map(|entry| {
-            entry
-                .models
-                .into_iter()
-                .take(MODEL_CACHE_PREVIEW_LIMIT)
-                .collect::<Vec<_>>()
-        })
+        .map(|entry| entry.models)
         .unwrap_or_default()
+}
+
+fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
+    load_cached_models(workspace_dir, provider_name)
+        .into_iter()
+        .take(MODEL_CACHE_PREVIEW_LIMIT)
+        .collect::<Vec<_>>()
+}
+
+fn pending_shell_approval_for_sender(sender_key: &str) -> bool {
+    pending_shell_approval_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(sender_key)
+}
+
+fn clear_pending_shell_approval(sender_key: &str) {
+    pending_shell_approval_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sender_key);
+}
+
+fn clear_pending_memory_cleanup(sender_key: &str) {
+    pending_memory_cleanup_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sender_key);
+}
+
+fn build_memory_help_response() -> String {
+    [
+        "Memory cleanup commands:",
+        "- `/memory clean` previews sender-scoped conversation memories that look like autosaved chat noise.",
+        "- `/memory clean current` is an explicit alias of `/memory clean`.",
+        "- `/memory clean confirm` deletes the previewed entries for this sender.",
+        "- `/memory clean current confirm` is an alias of `/memory clean confirm`.",
+        "- `/memory clean all` previews all memory entries across categories and sessions.",
+        "- `/memory clean all confirm` deletes all previewed memory entries.",
+    ]
+    .join("\n")
+}
+
+async fn list_sender_noise_memory_entries(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+    let prefix = format!("{sender_key}_");
+    let entries = ctx
+        .memory
+        .list(Some(&crate::memory::MemoryCategory::Conversation), None)
+        .await?;
+
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.key.starts_with(&prefix))
+        .collect())
+}
+
+async fn clear_sender_noise_memory_entries(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+) -> anyhow::Result<(usize, usize, usize)> {
+    let entries = list_sender_noise_memory_entries(ctx, sender_key).await?;
+    let matched = entries.len();
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+
+    for entry in entries {
+        match ctx.memory.forget(&entry.key).await {
+            Ok(true) => deleted += 1,
+            Ok(false) => {}
+            Err(err) => {
+                failed += 1;
+                tracing::warn!(
+                    key = %entry.key,
+                    "Failed to delete sender-scoped memory entry during /reset: {err}"
+                );
+            }
+        }
+    }
+
+    Ok((matched, deleted, failed))
+}
+
+async fn list_all_memory_entries(
+    ctx: &ChannelRuntimeContext,
+) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+    ctx.memory.list(None, None).await
+}
+
+async fn list_memory_entries_for_scope(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    scope: MemoryCleanupScope,
+) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+    match scope {
+        MemoryCleanupScope::SenderConversation => {
+            list_sender_noise_memory_entries(ctx, sender_key).await
+        }
+        MemoryCleanupScope::All => list_all_memory_entries(ctx).await,
+    }
+}
+
+async fn preview_memory_cleanup(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    scope: MemoryCleanupScope,
+) -> String {
+    let entries = match list_memory_entries_for_scope(ctx, sender_key, scope).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            let safe_err = providers::sanitize_api_error(&err.to_string());
+            return format!("Failed to inspect memory entries.\nDetails: {safe_err}");
+        }
+    };
+
+    if entries.is_empty() {
+        clear_pending_memory_cleanup(sender_key);
+        return match scope {
+            MemoryCleanupScope::SenderConversation => {
+                "No sender-scoped conversation memories found to clean.".to_string()
+            }
+            MemoryCleanupScope::All => {
+                "No memory entries found across all categories/sessions.".to_string()
+            }
+        };
+    }
+
+    pending_memory_cleanup_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            sender_key.to_string(),
+            PendingMemoryCleanup {
+                preview_count: entries.len(),
+                scope,
+            },
+        );
+
+    let preview_keys = entries
+        .iter()
+        .take(5)
+        .map(|entry| format!("- `{}`", entry.key))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more_marker = if entries.len() > 5 { "\n- `...`" } else { "" };
+
+    match scope {
+        MemoryCleanupScope::SenderConversation => format!(
+            "Found `{}` conversation memories for this sender that look like autosaved chat noise.\n{}{more_marker}\nReply `{}` (or `{}`) to delete them.",
+            entries.len(),
+            preview_keys,
+            scope.confirm_command(),
+            scope.alias_confirm_command().unwrap_or(scope.confirm_command())
+        ),
+        MemoryCleanupScope::All => format!(
+            "Found `{}` memory entries across all categories/sessions.\n{}{more_marker}\nReply `{}` to delete ALL of them.",
+            entries.len(),
+            preview_keys,
+            scope.confirm_command()
+        ),
+    }
+}
+
+async fn confirm_memory_cleanup(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    requested_scope: MemoryCleanupScope,
+) -> String {
+    let pending = {
+        let mut store = pending_memory_cleanup_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(pending) = store.get(sender_key).cloned() else {
+            return match requested_scope {
+                MemoryCleanupScope::SenderConversation => {
+                    "No pending memory cleanup for this sender. Run `/memory clean` first."
+                        .to_string()
+                }
+                MemoryCleanupScope::All => {
+                    "No pending global memory cleanup. Run `/memory clean all` first.".to_string()
+                }
+            };
+        };
+        if pending.scope != requested_scope {
+            return format!(
+                "Pending cleanup scope mismatch. Reply `{}` to continue, or start a new preview with `{}`.",
+                pending.scope.confirm_command(),
+                requested_scope.preview_command()
+            );
+        }
+        store.remove(sender_key);
+        pending
+    };
+
+    let entries = match list_memory_entries_for_scope(ctx, sender_key, pending.scope).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            let safe_err = providers::sanitize_api_error(&err.to_string());
+            return format!("Failed to load memory entries for cleanup.\nDetails: {safe_err}");
+        }
+    };
+
+    if entries.is_empty() {
+        return match pending.scope {
+            MemoryCleanupScope::SenderConversation => {
+                "No sender-scoped conversation memories remain to delete.".to_string()
+            }
+            MemoryCleanupScope::All => "No memory entries remain to delete.".to_string(),
+        };
+    }
+
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    let mut first_error: Option<String> = None;
+    for entry in &entries {
+        match ctx.memory.forget(&entry.key).await {
+            Ok(true) => deleted += 1,
+            Ok(false) => {}
+            Err(err) => {
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(providers::sanitize_api_error(&err.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut response = match pending.scope {
+        MemoryCleanupScope::SenderConversation => format!(
+            "Memory cleanup completed for this sender.\nMatched `{}` conversation memories (preview was `{}`). Deleted `{}`.",
+            entries.len(),
+            pending.preview_count,
+            deleted
+        ),
+        MemoryCleanupScope::All => format!(
+            "Global memory cleanup completed.\nMatched `{}` entries (preview was `{}`). Deleted `{}`.",
+            entries.len(),
+            pending.preview_count,
+            deleted
+        ),
+    };
+    if failed > 0 {
+        let detail = first_error.unwrap_or_else(|| "unknown error".to_string());
+        let _ = write!(
+            response,
+            "\nFailed to delete `{failed}` entries.\nDetails: {detail}"
+        );
+    } else if deleted == 0 && !entries.is_empty() {
+        let _ = write!(
+            response,
+            "\nBackend `{}` may be append-only for this memory type.",
+            ctx.memory.name()
+        );
+    }
+
+    response
+}
+
+fn sender_history_snapshot(ctx: &ChannelRuntimeContext, sender_key: &str) -> Vec<ChatMessage> {
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn archived_history_memory_key(sender_key: &str) -> String {
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    format!("{sender_key}_{unix_secs}_history")
+}
+
+async fn archive_sender_history(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+) -> anyhow::Result<Option<(String, usize)>> {
+    let turns = sender_history_snapshot(ctx, sender_key);
+    if turns.is_empty() {
+        return Ok(None);
+    }
+
+    let key = archived_history_memory_key(sender_key);
+    let payload = serde_json::to_string_pretty(&turns).unwrap_or_else(|_| "[]".to_string());
+    ctx.memory
+        .store(
+            &key,
+            &payload,
+            crate::memory::MemoryCategory::Daily,
+            Some(sender_key),
+        )
+        .await?;
+    Ok(Some((key, turns.len())))
 }
 
 async fn get_or_create_provider(
@@ -1060,7 +1444,9 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
         "Current provider: `{}`\nCurrent model: `{}`",
         current.provider, current.model
     );
-    response.push_str("\nSwitch model with `/model <model-id>`.\n");
+    response.push_str(
+        "\nUse `/model <number>` or `/model <model-id>` to switch. Use `/status` for full runtime status.\n",
+    );
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
@@ -1075,11 +1461,189 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
             "\nCached model IDs (top {}):",
             cached_models.len()
         );
-        for model in cached_models {
-            let _ = writeln!(response, "- `{model}`");
+        for (idx, model) in cached_models.iter().enumerate() {
+            let _ = writeln!(response, "{}. `{model}`", idx + 1);
         }
     }
 
+    response
+}
+
+async fn build_status_response(
+    ctx: &ChannelRuntimeContext,
+    current: &ChannelRouteSelection,
+    sender_key: &str,
+    channel_name: &str,
+) -> String {
+    fn format_temperature(value: f64) -> String {
+        if value.is_nan() {
+            "provider-default".to_string()
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn reasoning_override_label(value: Option<bool>) -> &'static str {
+        match value {
+            Some(true) => "enabled",
+            Some(false) => "disabled",
+            None => "provider-default",
+        }
+    }
+
+    fn reasoning_detail_for_provider(provider_name: &str, override_value: Option<bool>) -> String {
+        let provider = provider_name.to_ascii_lowercase();
+        let qwen_or_kimi_like = provider.contains("qwen")
+            || provider.contains("dashscope")
+            || provider.contains("kimi")
+            || provider.contains("moonshot");
+        match override_value {
+            Some(true) if provider == "anthropic" => {
+                "thinking.type=enabled, budget_tokens=1024".to_string()
+            }
+            Some(true) if qwen_or_kimi_like => "enable_thinking=true".to_string(),
+            Some(true) => "reasoning_effort=high".to_string(),
+            Some(false) if qwen_or_kimi_like => "enable_thinking=false".to_string(),
+            Some(false) => "disabled".to_string(),
+            None => "provider-managed default".to_string(),
+        }
+    }
+
+    let defaults = runtime_defaults_snapshot(ctx);
+    let history = sender_history_snapshot(ctx, sender_key);
+    let user_turns = history.iter().filter(|turn| turn.role == "user").count();
+    let assistant_turns = history
+        .iter()
+        .filter(|turn| turn.role == "assistant")
+        .count();
+    let cached_models = load_cached_models(ctx.workspace_dir.as_path(), &current.provider);
+    let provider_cache_size = ctx
+        .provider_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    let route_overrides = ctx
+        .route_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    let has_pending_shell_approval = pending_shell_approval_for_sender(sender_key);
+    let memory_count = ctx.memory.count().await.ok();
+    let memory_healthy = ctx.memory.health_check().await;
+    let (max_images, max_image_size_mb) = ctx.multimodal.effective_limits();
+    let default_temperature = format_temperature(defaults.temperature);
+    let reasoning_override =
+        reasoning_override_label(ctx.provider_runtime_options.reasoning_enabled);
+    let reasoning_detail = reasoning_detail_for_provider(
+        &current.provider,
+        ctx.provider_runtime_options.reasoning_enabled,
+    );
+    let runtime_config = runtime_config_path(ctx)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let api_url = ctx
+        .api_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or("provider-default");
+    let has_api_key = if ctx
+        .api_key
+        .as_ref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        "yes"
+    } else {
+        "no"
+    };
+    let build_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+
+    let mut response = String::new();
+    let _ = writeln!(
+        response,
+        "App: `freeclaw` v{} ({build_profile})",
+        env!("CARGO_PKG_VERSION")
+    );
+    let _ = writeln!(response, "Channel: `{channel_name}`");
+    let _ = writeln!(
+        response,
+        "Current provider: `{}`\nCurrent model: `{}`",
+        current.provider, current.model
+    );
+    let _ = writeln!(
+        response,
+        "Defaults: provider=`{}`, model=`{}`, temperature={}",
+        defaults.default_provider, defaults.model, default_temperature
+    );
+    let _ = writeln!(
+        response,
+        "Effective request: model=`{}`, temperature={}, reasoning={}",
+        current.model, default_temperature, reasoning_detail
+    );
+    let _ = writeln!(response, "Reasoning override: {}", reasoning_override);
+    let _ = writeln!(
+        response,
+        "Session: key=`{}` turns={} (user {}, assistant {})",
+        sender_key,
+        history.len(),
+        user_turns,
+        assistant_turns
+    );
+    let _ = writeln!(
+        response,
+        "Runtime: timeout={}s, max_tool_iterations={}, interrupt_on_new_message={}",
+        ctx.message_timeout_secs, ctx.max_tool_iterations, ctx.interrupt_on_new_message
+    );
+    let _ = writeln!(
+        response,
+        "Models cache: provider=`{}` cached_models={}",
+        current.provider,
+        cached_models.len()
+    );
+    let _ = writeln!(
+        response,
+        "Provider cache: initialized_providers={}, route_overrides={}",
+        provider_cache_size, route_overrides
+    );
+    let _ = writeln!(
+        response,
+        "Provider runtime: api_url=`{}`, api_key_present={}",
+        api_url, has_api_key
+    );
+    let _ = writeln!(
+        response,
+        "Memory: backend=`{}`, auto_save={}, total_entries={}, health={}",
+        ctx.memory.name(),
+        ctx.auto_save_memory,
+        memory_count.map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+        if memory_healthy { "ok" } else { "degraded" }
+    );
+    let _ = writeln!(
+        response,
+        "Multimodal: max_images={}, max_image_size_mb={}, allow_remote_fetch={}",
+        max_images, max_image_size_mb, ctx.multimodal.allow_remote_fetch
+    );
+    let _ = writeln!(
+        response,
+        "Pending shell approval for sender: {}",
+        if has_pending_shell_approval {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    let _ = writeln!(
+        response,
+        "Paths: workspace=`{}`, config=`{}`",
+        ctx.workspace_dir.display(),
+        runtime_config
+    );
+    response.push_str(
+        "\nCommands: `/status`, `/models list|status|<provider>`, `/model list|status|<number>|<model-id>`, `/memory clean|current`, `/memory clean confirm|current confirm`, `/memory clean all`, `/memory clean all confirm`, `/new`, `/reset`.",
+    );
     response
 }
 
@@ -1091,7 +1655,18 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
         current.provider, current.model
     );
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
-    response.push_str("Switch model with `/model <model-id>`.\n\n");
+    response
+        .push_str("Use `/models list` to show providers, `/models status` for current status.\n");
+    response.push_str(
+        "Use `/model list` to show models, `/model <number>` or `/model <model-id>` to switch.\n\n",
+    );
+    response.push_str(
+        "Use `/memory clean` (or `/memory clean current`) to preview sender-scoped conversation memories, then `/memory clean confirm` to delete.\n",
+    );
+    response.push_str(
+        "Use `/memory clean all` to preview all memory entries, then `/memory clean all confirm` to wipe everything.\n\n",
+    );
+    response.push_str("Use `/new` to archive and start a new session, `/reset` to start a new session without archiving and clear sender-scoped conversation memory.\n\n");
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
         if provider.aliases.is_empty() {
@@ -1126,6 +1701,9 @@ async fn handle_runtime_command_if_needed(
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
+        ChannelRuntimeCommand::ShowStatus => {
+            build_status_response(ctx, &current, &sender_key, &msg.channel).await
+        }
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
                 Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
@@ -1156,6 +1734,33 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowModel => {
             build_models_help_response(&current, ctx.workspace_dir.as_path())
         }
+        ChannelRuntimeCommand::SetModelByIndex(index) => {
+            if index == 0 {
+                "Invalid model index `0`. Use `/model list` to see valid model numbers.".to_string()
+            } else {
+                let available_models =
+                    load_cached_models(ctx.workspace_dir.as_path(), &current.provider);
+                if available_models.is_empty() {
+                    format!(
+                        "No cached model list found for `{}`. Ask the operator to run `freeclaw models refresh --provider {}`.",
+                        current.provider, current.provider
+                    )
+                } else if index > available_models.len() {
+                    format!(
+                        "Invalid model index `{index}`. Use `/model list` to see valid model numbers."
+                    )
+                } else {
+                    let model = available_models[index - 1].clone();
+                    current.model = model.clone();
+                    set_route_selection(ctx, &sender_key, current.clone());
+                    clear_sender_history(ctx, &sender_key);
+                    format!(
+                        "Model switched to `{model}` for provider `{}` in this sender session.",
+                        current.provider
+                    )
+                }
+            }
+        }
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
@@ -1171,9 +1776,57 @@ async fn handle_runtime_command_if_needed(
                 )
             }
         }
+        ChannelRuntimeCommand::ShowMemoryHelp => build_memory_help_response(),
+        ChannelRuntimeCommand::PrepareMemoryClean(scope) => {
+            preview_memory_cleanup(ctx, &sender_key, scope).await
+        }
+        ChannelRuntimeCommand::ConfirmMemoryClean(scope) => {
+            confirm_memory_cleanup(ctx, &sender_key, scope).await
+        }
         ChannelRuntimeCommand::NewSession => {
+            let archive_result = archive_sender_history(ctx, &sender_key).await;
+            clear_pending_shell_approval(&sender_key);
+            clear_pending_memory_cleanup(&sender_key);
             clear_sender_history(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            match archive_result {
+                Ok(Some((memory_key, turns))) => format!(
+                    "Conversation archived as `{memory_key}` ({turns} turns). Started a new session."
+                ),
+                Ok(None) => "Conversation history was empty. Started a new session.".to_string(),
+                Err(err) => {
+                    let safe_err = providers::sanitize_api_error(&err.to_string());
+                    format!(
+                        "Conversation history cleared, but failed to archive session log.\nDetails: {safe_err}"
+                    )
+                }
+            }
+        }
+        ChannelRuntimeCommand::ResetSession => {
+            clear_pending_shell_approval(&sender_key);
+            clear_pending_memory_cleanup(&sender_key);
+            clear_sender_history(ctx, &sender_key);
+            match clear_sender_noise_memory_entries(ctx, &sender_key).await {
+                Ok((matched, deleted, failed)) => {
+                    if matched == 0 {
+                        "Conversation history cleared without archiving log. Started a new session.\nNo sender-scoped conversation memory entries found."
+                            .to_string()
+                    } else if failed == 0 {
+                        format!(
+                            "Conversation history cleared without archiving log. Started a new session.\nSender-scoped conversation memory cleanup: matched `{matched}`, deleted `{deleted}`."
+                        )
+                    } else {
+                        format!(
+                            "Conversation history cleared without archiving log. Started a new session.\nSender-scoped conversation memory cleanup: matched `{matched}`, deleted `{deleted}`, failed `{failed}`."
+                        )
+                    }
+                }
+                Err(err) => {
+                    let safe_err = providers::sanitize_api_error(&err.to_string());
+                    format!(
+                        "Conversation history cleared without archiving log. Started a new session.\nFailed to inspect sender-scoped conversation memories.\nDetails: {safe_err}"
+                    )
+                }
+            }
         }
     };
 
@@ -2518,6 +3171,7 @@ pub fn build_system_prompt_with_mode(
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
+    prompt.push_str(ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX);
 
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
@@ -2582,6 +3236,16 @@ pub fn build_system_prompt_with_mode(
         prompt,
         "## Workspace\n\nWorking directory: `{}`\n",
         workspace_dir.display()
+    );
+
+    // ── 3b. Heartbeat automation contract ───────────────────────
+    prompt.push_str(
+        "## Heartbeat Automation\n\n\
+         Heartbeat runs in a separate daemon worker (not the chat reply loop).\n\
+         - Runtime config: `[heartbeat]` in `config.toml` controls `enabled`, `interval_minutes`, fallback `message`, and optional proactive delivery (`target` + `to`).\n\
+         - Task file: `HEARTBEAT.md` under the workspace; only lines starting with `- ` are parsed as tasks.\n\
+         - `HEARTBEAT.md` is intentionally not auto-injected into normal chat prompts to avoid noisy acknowledgments.\n\
+         If a user asks to inspect or change heartbeat behavior, read/edit `config.toml` and `HEARTBEAT.md` directly with file tools.\n\n",
     );
 
     // ── 4. Bootstrap files (injected into context) ──────────────
@@ -3314,7 +3978,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
     ));
     let model = resolved_default_model(&config);
-    let temperature = config.default_temperature;
+    let temperature = config.default_temperature.unwrap_or(f64::NAN);
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
         Some(&config.storage.provider.config),
@@ -3644,6 +4308,100 @@ mod tests {
             channel_message_timeout_budget_secs(300, 10),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
+    }
+
+    #[test]
+    fn parse_runtime_command_supports_model_and_models_subcommands() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/status"),
+            Some(ChannelRuntimeCommand::ShowStatus)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models"),
+            Some(ChannelRuntimeCommand::ShowProviders)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models list"),
+            Some(ChannelRuntimeCommand::ShowProviders)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models status"),
+            Some(ChannelRuntimeCommand::ShowStatus)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models openrouter"),
+            Some(ChannelRuntimeCommand::SetProvider("openrouter".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/model"),
+            Some(ChannelRuntimeCommand::ShowModel)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/model list"),
+            Some(ChannelRuntimeCommand::ShowModel)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/model status"),
+            Some(ChannelRuntimeCommand::ShowStatus)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/model 2"),
+            Some(ChannelRuntimeCommand::SetModelByIndex(2))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/model gpt-4o"),
+            Some(ChannelRuntimeCommand::SetModel("gpt-4o".to_string()))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/memory"),
+            Some(ChannelRuntimeCommand::ShowMemoryHelp)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/memory clean"),
+            Some(ChannelRuntimeCommand::PrepareMemoryClean(
+                MemoryCleanupScope::SenderConversation
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/memory clean current"),
+            Some(ChannelRuntimeCommand::PrepareMemoryClean(
+                MemoryCleanupScope::SenderConversation
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/memory clean confirm"),
+            Some(ChannelRuntimeCommand::ConfirmMemoryClean(
+                MemoryCleanupScope::SenderConversation
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/memory clean current confirm"),
+            Some(ChannelRuntimeCommand::ConfirmMemoryClean(
+                MemoryCleanupScope::SenderConversation
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/memory clean all"),
+            Some(ChannelRuntimeCommand::PrepareMemoryClean(
+                MemoryCleanupScope::All
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/memory clean all confirm"),
+            Some(ChannelRuntimeCommand::ConfirmMemoryClean(
+                MemoryCleanupScope::All
+            ))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/new"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/reset"),
+            Some(ChannelRuntimeCommand::ResetSession)
+        );
+        assert_eq!(parse_runtime_command("slack", "/model 2"), None);
+        assert_eq!(parse_runtime_command("slack", "/memory clean"), None);
     }
 
     #[test]
@@ -4655,6 +5413,867 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_switches_model_by_index_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let workspace = TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(workspace.path().join("state")).expect("create state dir");
+        std::fs::write(
+            workspace.path().join("state").join(MODEL_CACHE_FILE),
+            r#"{"entries":[{"provider":"openrouter","models":["model-a","model-b","model-c"]}]}"#,
+        )
+        .expect("write model cache");
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-model-index-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/model 2".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Model switched to `model-b`"));
+
+        let route_key = "telegram_alice";
+        let route = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route_key)
+            .cloned()
+            .expect("route should be stored for sender");
+        assert_eq!(route.provider, "openrouter");
+        assert_eq!(route.model, "model-b");
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_status_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: f64::NAN,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-status-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/status".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains(&format!("App: `freeclaw` v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(sent[0].contains("Channel: `telegram`"));
+        assert!(sent[0].contains("Current provider: `openrouter`"));
+        assert!(sent[0].contains("Current model: `default-model`"));
+        assert!(sent[0].contains("temperature=provider-default"));
+        assert!(sent[0].contains("Reasoning override: enabled"));
+        assert!(!sent[0].contains("temperature=NaN"));
+        assert!(sent[0].contains("Session: key=`telegram_alice`"));
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_new_archives_history_and_clears_session() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let recording_memory = Arc::new(RecordingMemory::default());
+        let mut seeded_history = HashMap::new();
+        seeded_history.insert(
+            "telegram_alice".to_string(),
+            vec![
+                ChatMessage::user("hello"),
+                ChatMessage::assistant("hi, how can I help?"),
+            ],
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: recording_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.5,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(seeded_history)),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-new-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/new".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Conversation archived as"));
+        assert!(sent[0].contains("Started a new session"));
+
+        assert!(runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("telegram_alice")
+            .is_none());
+
+        let stores = recording_memory
+            .stores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stores.len(), 1);
+        assert!(stores[0].0.ends_with("_history"));
+        assert!(stores[0].1.contains("\"role\": \"user\""));
+        assert!(stores[0].1.contains("\"role\": \"assistant\""));
+        assert_eq!(stores[0].3.as_deref(), Some("telegram_alice"));
+        drop(stores);
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_reset_clears_session_without_archiving() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let recording_memory = Arc::new(RecordingMemory::default());
+        recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([
+                crate::memory::MemoryEntry {
+                    id: "1".to_string(),
+                    key: "telegram_alice_msg-a".to_string(),
+                    content: "sender autosave".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:00Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+                crate::memory::MemoryEntry {
+                    id: "2".to_string(),
+                    key: "telegram_bob_msg-b".to_string(),
+                    content: "other sender autosave".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:01Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+            ]);
+        let mut seeded_history = HashMap::new();
+        seeded_history.insert(
+            "telegram_alice".to_string(),
+            vec![ChatMessage::user("hello before reset")],
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: recording_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.5,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(seeded_history)),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-reset-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/reset".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("without archiving log"));
+
+        assert!(runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("telegram_alice")
+            .is_none());
+        assert!(recording_memory
+            .stores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        let forgotten_keys = recording_memory
+            .forgotten_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            forgotten_keys.iter().any(|key| key == "telegram_alice_msg-a"),
+            "sender-scoped conversation memory should be deleted on /reset"
+        );
+        assert!(
+            !forgotten_keys.iter().any(|key| key == "telegram_bob_msg-b"),
+            "other sender memory should not be deleted on /reset"
+        );
+        let remaining_entries = recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(remaining_entries.len(), 1);
+        assert_eq!(remaining_entries[0].key, "telegram_bob_msg-b");
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_memory_clean_previews_sender_scoped_entries() {
+        let sender = "noise_preview_user";
+        let sender_key = format!("telegram_{sender}");
+        clear_pending_memory_cleanup(&sender_key);
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let recording_memory = Arc::new(RecordingMemory::default());
+        recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([
+                crate::memory::MemoryEntry {
+                    id: "1".to_string(),
+                    key: format!("{sender_key}_msg-a"),
+                    content: "first autosave".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:00Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+                crate::memory::MemoryEntry {
+                    id: "2".to_string(),
+                    key: format!("{sender_key}_msg-b"),
+                    content: "second autosave".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:01Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+                crate::memory::MemoryEntry {
+                    id: "3".to_string(),
+                    key: "telegram_other_sender_msg-c".to_string(),
+                    content: "other sender".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:02Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+            ]);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: recording_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.5,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-memory-clean-preview".to_string(),
+                sender: sender.to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/memory clean".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Found `2` conversation memories"));
+        assert!(sent[0].contains("Reply `/memory clean confirm`"));
+        drop(sent);
+
+        assert!(recording_memory
+            .forgotten_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert!(pending_memory_cleanup_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&sender_key));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_memory_clean_confirm_deletes_sender_scoped_entries() {
+        let sender = "noise_confirm_user";
+        let sender_key = format!("telegram_{sender}");
+        clear_pending_memory_cleanup(&sender_key);
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let recording_memory = Arc::new(RecordingMemory::default());
+        recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([
+                crate::memory::MemoryEntry {
+                    id: "1".to_string(),
+                    key: format!("{sender_key}_msg-a"),
+                    content: "first autosave".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:00Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+                crate::memory::MemoryEntry {
+                    id: "2".to_string(),
+                    key: format!("{sender_key}_msg-b"),
+                    content: "second autosave".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:01Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+                crate::memory::MemoryEntry {
+                    id: "3".to_string(),
+                    key: "telegram_other_sender_msg-c".to_string(),
+                    content: "other sender".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:02Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+            ]);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: recording_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.5,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-memory-clean-confirm-1".to_string(),
+                sender: sender.to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/memory clean".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-memory-clean-confirm-2".to_string(),
+                sender: sender.to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/memory clean confirm".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("Reply `/memory clean confirm`"));
+        assert!(sent[1].contains("Deleted `2`."));
+        drop(sent);
+
+        let remaining_entries = recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(remaining_entries.len(), 1);
+        assert_eq!(remaining_entries[0].key, "telegram_other_sender_msg-c");
+
+        let forgotten_keys = recording_memory
+            .forgotten_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(forgotten_keys.len(), 2);
+        assert!(forgotten_keys
+            .iter()
+            .all(|key| key.starts_with(&sender_key)));
+        assert!(!pending_memory_cleanup_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&sender_key));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_memory_clean_all_preview_and_confirm_wipes_all_entries() {
+        let sender = "wipe_all_user";
+        let sender_key = format!("telegram_{sender}");
+        clear_pending_memory_cleanup(&sender_key);
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let recording_memory = Arc::new(RecordingMemory::default());
+        recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([
+                crate::memory::MemoryEntry {
+                    id: "1".to_string(),
+                    key: format!("{sender_key}_msg-a"),
+                    content: "conversation memory".to_string(),
+                    category: crate::memory::MemoryCategory::Conversation,
+                    timestamp: "2026-02-28T00:00:00Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+                crate::memory::MemoryEntry {
+                    id: "2".to_string(),
+                    key: "daily_note_1".to_string(),
+                    content: "daily memory".to_string(),
+                    category: crate::memory::MemoryCategory::Daily,
+                    timestamp: "2026-02-28T00:00:01Z".to_string(),
+                    session_id: Some("session-a".to_string()),
+                    score: None,
+                },
+                crate::memory::MemoryEntry {
+                    id: "3".to_string(),
+                    key: "core_pref_1".to_string(),
+                    content: "core preference".to_string(),
+                    category: crate::memory::MemoryCategory::Core,
+                    timestamp: "2026-02-28T00:00:02Z".to_string(),
+                    session_id: None,
+                    score: None,
+                },
+            ]);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: recording_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.5,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-memory-clean-all-preview".to_string(),
+                sender: sender.to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/memory clean all".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-memory-clean-all-confirm".to_string(),
+                sender: sender.to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/memory clean all confirm".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("Reply `/memory clean all confirm`"));
+        assert!(sent[1].contains("Global memory cleanup completed."));
+        assert!(sent[1].contains("Deleted `3`."));
+        drop(sent);
+
+        let remaining_entries = recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(remaining_entries.is_empty());
+
+        let forgotten_keys = recording_memory
+            .forgotten_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(forgotten_keys.len(), 3);
+        assert!(!pending_memory_cleanup_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&sender_key));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_memory_clean_scope_mismatch_keeps_pending_preview() {
+        let sender = "scope_mismatch_user";
+        let sender_key = format!("telegram_{sender}");
+        clear_pending_memory_cleanup(&sender_key);
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let recording_memory = Arc::new(RecordingMemory::default());
+        recording_memory
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(crate::memory::MemoryEntry {
+                id: "1".to_string(),
+                key: "daily_note_1".to_string(),
+                content: "daily memory".to_string(),
+                category: crate::memory::MemoryCategory::Daily,
+                timestamp: "2026-02-28T00:00:01Z".to_string(),
+                session_id: Some("session-a".to_string()),
+                score: None,
+            });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: recording_memory.clone(),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.5,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-memory-clean-all-preview".to_string(),
+                sender: sender.to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/memory clean all".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-memory-clean-scope-mismatch".to_string(),
+                sender: sender.to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/memory clean confirm".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].contains("Pending cleanup scope mismatch"));
+        drop(sent);
+
+        assert!(recording_memory
+            .forgotten_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert!(pending_memory_cleanup_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&sender_key));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn process_channel_message_uses_route_override_provider_and_model() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -5123,6 +6742,102 @@ BTC is currently around $65,000 based on latest tool output."#
 
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(1)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingMemory {
+        stores: Mutex<
+            Vec<(
+                String,
+                String,
+                crate::memory::MemoryCategory,
+                Option<String>,
+            )>,
+        >,
+        entries: Mutex<Vec<crate::memory::MemoryEntry>>,
+        forgotten_keys: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for RecordingMemory {
+        fn name(&self) -> &str {
+            "recording-memory"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: crate::memory::MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.stores.lock().unwrap_or_else(|e| e.into_inner()).push((
+                key.to_string(),
+                content.to_string(),
+                category,
+                session_id.map(ToString::to_string),
+            ));
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|entry| entry.key == key)
+                .cloned())
+        }
+
+        async fn list(
+            &self,
+            category: Option<&crate::memory::MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(entries
+                .iter()
+                .filter(|entry| match category {
+                    Some(cat) => entry.category == *cat,
+                    None => true,
+                })
+                .filter(|entry| match session_id {
+                    Some(sid) => entry.session_id.as_deref() == Some(sid),
+                    None => true,
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            self.forgotten_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key.to_string());
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let before = entries.len();
+            entries.retain(|entry| entry.key != key);
+            Ok(before != entries.len())
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.stores.lock().unwrap_or_else(|e| e.into_inner()).len()
+                + self.entries.lock().unwrap_or_else(|e| e.into_inner()).len())
         }
 
         async fn health_check(&self) -> bool {

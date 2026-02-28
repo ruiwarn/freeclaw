@@ -124,6 +124,41 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
+fn build_telegram_set_my_commands_request() -> serde_json::Value {
+    serde_json::json!({
+        "commands": [
+            {
+                "command": "status",
+                "description": "Show current runtime status"
+            },
+            {
+                "command": "models",
+                "description": "List providers or switch provider"
+            },
+            {
+                "command": "model",
+                "description": "List models or switch model"
+            },
+            {
+                "command": "memory",
+                "description": "Preview or clean memory entries"
+            },
+            {
+                "command": "new",
+                "description": "Start new session and archive chat log"
+            },
+            {
+                "command": "reset",
+                "description": "Start new session without archiving log"
+            },
+            {
+                "command": "bind",
+                "description": "Pair this Telegram account with /bind <code>"
+            }
+        ]
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
@@ -554,6 +589,40 @@ impl TelegramChannel {
                 tracing::warn!("Failed to fetch bot username: {e}");
                 None
             }
+        }
+    }
+
+    async fn register_default_commands(&self) -> anyhow::Result<()> {
+        let response = self
+            .http_client()
+            .post(self.api_url("setMyCommands"))
+            .json(&build_telegram_set_my_commands_request())
+            .send()
+            .await
+            .context("Failed to call Telegram setMyCommands")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMyCommands failed ({status}): {body}");
+        }
+
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Telegram setMyCommands response")?;
+        let ok = payload
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if ok {
+            Ok(())
+        } else {
+            let description = payload
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            anyhow::bail!("Telegram setMyCommands returned ok=false: {description}");
         }
     }
 
@@ -2457,6 +2526,10 @@ impl Channel for TelegramChannel {
             let _ = self.get_bot_username().await;
         }
 
+        if let Err(err) = self.register_default_commands().await {
+            tracing::warn!("Telegram command menu registration failed: {err}");
+        }
+
         tracing::info!("Telegram channel listening for messages...");
 
         // Startup probe: claim the getUpdates slot before entering the long-poll loop.
@@ -2723,6 +2796,23 @@ mod tests {
         assert_eq!(body["message_id"], 42);
         assert_eq!(body["reaction"][0]["type"], "emoji");
         assert_eq!(body["reaction"][0]["emoji"], "⚡️");
+    }
+
+    #[test]
+    fn telegram_set_my_commands_request_shape() {
+        let body = build_telegram_set_my_commands_request();
+        let commands = body
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .expect("commands should be an array");
+        assert_eq!(commands.len(), 7);
+        assert_eq!(commands[0]["command"], "status");
+        assert_eq!(commands[1]["command"], "models");
+        assert_eq!(commands[2]["command"], "model");
+        assert_eq!(commands[3]["command"], "memory");
+        assert_eq!(commands[4]["command"], "new");
+        assert_eq!(commands[5]["command"], "reset");
+        assert_eq!(commands[6]["command"], "bind");
     }
 
     #[test]

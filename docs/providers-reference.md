@@ -137,9 +137,9 @@ credential is not reused for fallback providers.
 - Cross-region inference profiles supported (e.g., `us.anthropic.claude-*`).
 - Model IDs use Bedrock format: `anthropic.claude-sonnet-4-6`, `anthropic.claude-opus-4-6-v1`, etc.
 
-### Ollama Reasoning Toggle
+### Runtime Reasoning Toggle
 
-You can control Ollama reasoning/thinking behavior from `config.toml`:
+You can control provider-side reasoning/thinking behavior from `config.toml`:
 
 ```toml
 [runtime]
@@ -148,9 +148,13 @@ reasoning_enabled = false
 
 Behavior:
 
-- `false`: sends `think: false` to Ollama `/api/chat` requests.
-- `true`: sends `think: true`.
-- Unset: omits `think` and keeps Ollama/model defaults.
+- `ollama`: maps to `think` on `/api/chat` (`false` -> `think: false`, `true` -> `think: true`).
+- `anthropic` and `anthropic-custom:*`: when `true`, sends `thinking: { type: "enabled", budget_tokens: 1024 }`.
+- `openai` and `openrouter`: when `true`, sends `reasoning_effort: "high"`.
+- OpenAI-compatible providers (for example `qwen`, `qwen-code`, `kimi-code`):
+  - DashScope/Qwen/Kimi-compatible endpoints send `enable_thinking: <bool>`.
+  - Other compatible endpoints send `reasoning_effort: "high"` when `true`.
+- Default is enabled (`true`). Set `reasoning_enabled = false` to disable provider-side reasoning.
 
 ### Kimi Code Notes
 

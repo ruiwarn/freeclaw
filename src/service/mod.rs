@@ -236,17 +236,22 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
 
 fn status(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
-        let out = run_capture(Command::new("launchctl").arg("list"))?;
-        let running = out.lines().any(|line| line.contains(SERVICE_LABEL));
+        let plist = macos_service_file()?;
+        if !plist.exists() {
+            println!("Service: ❌ not installed");
+            println!("Unit: {}", plist.display());
+            return Ok(());
+        }
+        let state = detect_macos_service_state()?;
         println!(
             "Service: {}",
-            if running {
-                "✅ running/loaded"
-            } else {
-                "❌ not loaded"
+            match state {
+                MacOsServiceState::Running => "✅ running/loaded",
+                MacOsServiceState::Loaded => "⚠️ loaded (not running)",
+                MacOsServiceState::NotLoaded => "❌ not loaded",
             }
         );
-        println!("Unit: {}", macos_service_file()?.display());
+        println!("Unit: {}", plist.display());
         return Ok(());
     }
 
@@ -281,6 +286,86 @@ fn status(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 
     anyhow::bail!("Service management is supported on macOS and Linux only")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacOsServiceState {
+    Running,
+    Loaded,
+    NotLoaded,
+}
+
+fn detect_macos_service_state() -> Result<MacOsServiceState> {
+    let mut print_state: Option<MacOsServiceState> = None;
+
+    if let Ok(uid) = run_capture(Command::new("id").arg("-u")) {
+        let uid = uid.trim();
+        if !uid.is_empty() {
+            let target = format!("gui/{uid}/{SERVICE_LABEL}");
+            if let Ok(output) = run_capture(Command::new("launchctl").args(["print", &target])) {
+                print_state = parse_launchctl_print_state(&output);
+            }
+        }
+    }
+
+    // Fallback to list parsing to avoid false negatives when `launchctl print`
+    // output differs across macOS versions or is unavailable.
+    if let Ok(list_output) = run_capture(Command::new("launchctl").arg("list")) {
+        if let Some(state) = parse_launchctl_list_state(&list_output) {
+            return Ok(state);
+        }
+    }
+
+    Ok(print_state.unwrap_or(MacOsServiceState::NotLoaded))
+}
+
+fn parse_launchctl_print_state(output: &str) -> Option<MacOsServiceState> {
+    let lower = output.to_ascii_lowercase();
+
+    if lower.contains("state = running") {
+        return Some(MacOsServiceState::Running);
+    }
+
+    // Loaded but currently not running
+    if lower.contains("state =") || lower.contains("path =") || lower.contains("program =") {
+        return Some(MacOsServiceState::Loaded);
+    }
+
+    if lower.contains("could not find service")
+        || lower.contains("not found in domain")
+        || lower.contains("unknown service")
+    {
+        return Some(MacOsServiceState::NotLoaded);
+    }
+
+    None
+}
+
+fn parse_launchctl_list_state(output: &str) -> Option<MacOsServiceState> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("PID") || !trimmed.contains(SERVICE_LABEL) {
+            continue;
+        }
+
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() >= 3 {
+            let pid = cols[0];
+            let label = cols[cols.len() - 1];
+            if label == SERVICE_LABEL {
+                return Some(if pid == "-" {
+                    MacOsServiceState::Loaded
+                } else {
+                    MacOsServiceState::Running
+                });
+            }
+        }
+
+        // Fallback: if line contains label but shape is unexpected, treat as loaded.
+        return Some(MacOsServiceState::Loaded);
+    }
+
+    None
 }
 
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
@@ -1111,6 +1196,67 @@ mod tests {
         let err = run_checked(Command::new("sh").args(["-lc", "exit 17"]))
             .expect_err("non-zero exit should error");
         assert!(err.to_string().contains("Command failed"));
+    }
+
+    #[test]
+    fn parse_launchctl_print_state_detects_running() {
+        let output = r#"
+gui/501/com.freeclaw.daemon = {
+    state = running
+    path = /Users/test/Library/LaunchAgents/com.freeclaw.daemon.plist
+}
+"#;
+        assert_eq!(
+            parse_launchctl_print_state(output),
+            Some(MacOsServiceState::Running)
+        );
+    }
+
+    #[test]
+    fn parse_launchctl_print_state_detects_loaded_not_running() {
+        let output = r#"
+gui/501/com.freeclaw.daemon = {
+    state = exited
+    path = /Users/test/Library/LaunchAgents/com.freeclaw.daemon.plist
+}
+"#;
+        assert_eq!(
+            parse_launchctl_print_state(output),
+            Some(MacOsServiceState::Loaded)
+        );
+    }
+
+    #[test]
+    fn parse_launchctl_print_state_detects_not_loaded() {
+        let output = "Could not find service \"com.freeclaw.daemon\" in domain for user gui:501";
+        assert_eq!(
+            parse_launchctl_print_state(output),
+            Some(MacOsServiceState::NotLoaded)
+        );
+    }
+
+    #[test]
+    fn parse_launchctl_list_state_detects_running() {
+        let output = "PID\tStatus\tLabel\n123\t0\tcom.freeclaw.daemon\n";
+        assert_eq!(
+            parse_launchctl_list_state(output),
+            Some(MacOsServiceState::Running)
+        );
+    }
+
+    #[test]
+    fn parse_launchctl_list_state_detects_loaded_not_running() {
+        let output = "PID\tStatus\tLabel\n-\t0\tcom.freeclaw.daemon\n";
+        assert_eq!(
+            parse_launchctl_list_state(output),
+            Some(MacOsServiceState::Loaded)
+        );
+    }
+
+    #[test]
+    fn parse_launchctl_list_state_detects_missing() {
+        let output = "PID\tStatus\tLabel\n123\t0\tcom.apple.something\n";
+        assert_eq!(parse_launchctl_list_state(output), None);
     }
 
     #[cfg(not(target_os = "windows"))]

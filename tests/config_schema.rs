@@ -14,10 +14,10 @@ fn config_unknown_keys_parse_without_error() {
     let toml_str = r#"
 default_temperature = 0.7
 totally_unknown_key = "should be ignored"
-another_fake = 42
+    another_fake = 42
 "#;
     let parsed: Config = toml::from_str(toml_str).expect("unknown keys should be ignored");
-    assert!((parsed.default_temperature - 0.7).abs() < f64::EPSILON);
+    assert_eq!(parsed.default_temperature, Some(0.7));
 }
 
 #[test]
@@ -218,12 +218,10 @@ fn autonomy_config_toml_roundtrip() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn config_empty_toml_requires_temperature() {
+fn config_empty_toml_parses_with_optional_temperature() {
     let result: Result<Config, _> = toml::from_str("");
-    assert!(
-        result.is_err(),
-        "empty TOML should fail because default_temperature is required"
-    );
+    assert!(result.is_ok(), "empty TOML should parse");
+    assert_eq!(result.unwrap().default_temperature, None);
 }
 
 #[test]
@@ -238,7 +236,7 @@ fn config_minimal_toml_with_temperature_uses_defaults() {
 fn config_only_temperature_parses() {
     let toml_str = "default_temperature = 1.2\n";
     let parsed: Config = toml::from_str(toml_str).expect("temperature-only TOML should parse");
-    assert!((parsed.default_temperature - 1.2).abs() < f64::EPSILON);
+    assert_eq!(parsed.default_temperature, Some(1.2));
     assert_eq!(parsed.agent.max_tool_iterations, 10);
 }
 
@@ -252,7 +250,7 @@ value = 123
 "#;
     let parsed: Config =
         toml::from_str(toml_str).expect("unknown keys and sections should be ignored");
-    assert!((parsed.default_temperature - 0.5).abs() < f64::EPSILON);
+    assert_eq!(parsed.default_temperature, Some(0.5));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,7 +285,8 @@ fn config_nested_optional_sections_default_when_absent() {
     assert!(parsed.channels_config.telegram.is_none());
     assert!(!parsed.composio.enabled);
     assert!(parsed.composio.api_key.is_none());
-    assert!(!parsed.browser.enabled);
+    assert!(parsed.browser.enabled);
+    assert_eq!(parsed.browser.allowed_domains, vec!["*"]);
 }
 
 #[test]

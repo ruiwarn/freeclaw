@@ -84,7 +84,8 @@ pub struct Config {
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
-    pub default_temperature: f64,
+    #[serde(default)]
+    pub default_temperature: Option<f64>,
 
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
@@ -405,7 +406,7 @@ pub struct AgentConfig {
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
-    /// Enable parallel tool execution within a single iteration. Default: `false`.
+    /// Enable parallel tool execution within a single iteration. Default: `true`.
     #[serde(default)]
     pub parallel_tools: bool,
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
@@ -431,7 +432,7 @@ impl Default for AgentConfig {
             compact_context: false,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
-            parallel_tools: false,
+            parallel_tools: true,
             tool_dispatcher: default_agent_tool_dispatcher(),
         }
     }
@@ -460,7 +461,7 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
-    /// Default: `false` (opt-in).
+    /// Default: `true`.
     #[serde(default)]
     pub open_skills_enabled: bool,
     /// Optional path to a local open-skills repository.
@@ -476,7 +477,7 @@ pub struct SkillsConfig {
 impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
-            open_skills_enabled: false,
+            open_skills_enabled: true,
             open_skills_dir: None,
             prompt_injection_mode: SkillsPromptInjectionMode::default(),
         }
@@ -994,8 +995,8 @@ fn default_browser_webdriver_url() -> String {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            allowed_domains: Vec::new(),
+            enabled: true,
+            allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
             native_headless: default_true(),
@@ -1030,8 +1031,8 @@ pub struct HttpRequestConfig {
 impl Default for HttpRequestConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            allowed_domains: vec![],
+            enabled: true,
+            allowed_domains: vec!["*".into()],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
         }
@@ -1084,7 +1085,7 @@ fn default_web_fetch_timeout_secs() -> u64 {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             allowed_domains: vec!["*".into()],
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
@@ -1130,7 +1131,7 @@ fn default_web_search_timeout_secs() -> u64 {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
             max_results: default_web_search_max_results(),
@@ -2097,10 +2098,10 @@ pub struct RuntimeConfig {
     pub docker: DockerRuntimeConfig,
 
     /// Global reasoning override for providers that expose explicit controls.
-    /// - `None`: provider default behavior
-    /// - `Some(true)`: request reasoning/thinking when supported
+    /// - `Some(true)` (default): request reasoning/thinking when supported
     /// - `Some(false)`: disable reasoning/thinking when supported
-    #[serde(default)]
+    /// - `None`: legacy/manual state (providers handle their own defaults)
+    #[serde(default = "default_reasoning_enabled")]
     pub reasoning_enabled: Option<bool>,
 }
 
@@ -2156,6 +2157,10 @@ fn default_docker_cpu_limit() -> Option<f64> {
     Some(1.0)
 }
 
+fn default_reasoning_enabled() -> Option<bool> {
+    Some(true)
+}
+
 impl Default for DockerRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -2175,7 +2180,7 @@ impl Default for RuntimeConfig {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
-            reasoning_enabled: None,
+            reasoning_enabled: default_reasoning_enabled(),
         }
     }
 }
@@ -2397,7 +2402,7 @@ pub struct ClassificationRule {
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HeartbeatConfig {
-    /// Enable periodic heartbeat pings. Default: `false`.
+    /// Enable periodic heartbeat pings. Default: `true`.
     pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
@@ -2415,9 +2420,9 @@ pub struct HeartbeatConfig {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             interval_minutes: 30,
-            message: None,
+            message: Some("Check current status and send a brief heartbeat update.".into()),
             target: None,
             to: None,
         }
@@ -3595,7 +3600,7 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
-            default_temperature: 0.7,
+            default_temperature: Some(0.7),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -4458,7 +4463,7 @@ impl Config {
             }
         }
 
-        // Open-skills opt-in flag: FREECLAW_OPEN_SKILLS_ENABLED
+        // Open-skills toggle: FREECLAW_OPEN_SKILLS_ENABLED
         if let Ok(flag) = std::env::var("FREECLAW_OPEN_SKILLS_ENABLED") {
             if !flag.trim().is_empty() {
                 match flag.trim().to_ascii_lowercase().as_str() {
@@ -4518,7 +4523,7 @@ impl Config {
         if let Ok(temp_str) = std::env::var("FREECLAW_TEMPERATURE") {
             if let Ok(temp) = temp_str.parse::<f64>() {
                 if (0.0..=2.0).contains(&temp) {
-                    self.default_temperature = temp;
+                    self.default_temperature = Some(temp);
                 }
             }
         }
@@ -4852,8 +4857,8 @@ mod tests {
         let cfg = HttpRequestConfig::default();
         assert_eq!(cfg.timeout_secs, 30);
         assert_eq!(cfg.max_response_size, 1_000_000);
-        assert!(!cfg.enabled);
-        assert!(cfg.allowed_domains.is_empty());
+        assert!(cfg.enabled);
+        assert_eq!(cfg.allowed_domains, vec!["*"]);
     }
 
     #[test]
@@ -4861,9 +4866,9 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
         assert!(c.default_model.as_deref().unwrap().contains("claude"));
-        assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
+        assert_eq!(c.default_temperature, Some(0.7));
         assert!(c.api_key.is_none());
-        assert!(!c.skills.open_skills_enabled);
+        assert!(c.skills.open_skills_enabled);
         assert_eq!(
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
@@ -4968,14 +4973,18 @@ mod tests {
         assert_eq!(r.docker.cpu_limit, Some(1.0));
         assert!(r.docker.read_only_rootfs);
         assert!(r.docker.mount_workspace);
+        assert_eq!(r.reasoning_enabled, Some(true));
     }
 
     #[test]
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
-        assert!(!h.enabled);
+        assert!(h.enabled);
         assert_eq!(h.interval_minutes, 30);
-        assert!(h.message.is_none());
+        assert_eq!(
+            h.message.as_deref(),
+            Some("Check current status and send a brief heartbeat update.")
+        );
         assert!(h.target.is_none());
         assert!(h.to.is_none());
     }
@@ -5071,7 +5080,7 @@ default_temperature = 0.7
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
-            default_temperature: 0.5,
+            default_temperature: Some(0.5),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -5169,7 +5178,7 @@ default_temperature = 0.7
         assert_eq!(parsed.api_key, config.api_key);
         assert_eq!(parsed.default_provider, config.default_provider);
         assert_eq!(parsed.default_model, config.default_model);
-        assert!((parsed.default_temperature - config.default_temperature).abs() < f64::EPSILON);
+        assert_eq!(parsed.default_temperature, config.default_temperature);
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
@@ -5204,12 +5213,36 @@ default_temperature = 0.7
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
-        assert!(!parsed.heartbeat.enabled);
+        assert!(parsed.heartbeat.enabled);
+        assert_eq!(
+            parsed.heartbeat.message.as_deref(),
+            Some("Check current status and send a brief heartbeat update.")
+        );
+        assert!(parsed.browser.enabled);
+        assert_eq!(parsed.browser.allowed_domains, vec!["*"]);
+        assert!(parsed.http_request.enabled);
+        assert_eq!(parsed.http_request.allowed_domains, vec!["*"]);
+        assert!(parsed.web_fetch.enabled);
+        assert_eq!(parsed.web_fetch.allowed_domains, vec!["*"]);
+        assert!(parsed.web_search.enabled);
+        assert!(!parsed.composio.enabled);
+        assert!(parsed.skills.open_skills_enabled);
+        assert!(parsed.agent.parallel_tools);
         assert!(parsed.channels_config.cli);
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
+    }
+
+    #[test]
+    async fn config_minimal_toml_without_temperature_uses_provider_default() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert_eq!(parsed.default_temperature, None);
     }
 
     #[test]
@@ -5258,7 +5291,7 @@ reasoning_enabled = false
         assert!(!cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 50);
-        assert!(!cfg.parallel_tools);
+        assert!(cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
     }
 
@@ -5309,7 +5342,7 @@ tool_dispatcher = "xml"
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
-            default_temperature: 0.9,
+            default_temperature: Some(0.9),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -5358,7 +5391,7 @@ tool_dispatcher = "xml"
         let decrypted = store.decrypt(loaded.api_key.as_deref().unwrap()).unwrap();
         assert_eq!(decrypted, "sk-roundtrip");
         assert_eq!(loaded.default_model.as_deref(), Some("test-model"));
-        assert!((loaded.default_temperature - 0.9).abs() < f64::EPSILON);
+        assert_eq!(loaded.default_temperature, Some(0.9));
 
         let _ = fs::remove_dir_all(&dir).await;
     }
@@ -6154,15 +6187,15 @@ default_temperature = 0.7
         assert!(!c.composio.enabled);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
-        assert!(!c.browser.enabled);
-        assert!(c.browser.allowed_domains.is_empty());
+        assert!(c.browser.enabled);
+        assert_eq!(c.browser.allowed_domains, vec!["*"]);
     }
 
     #[test]
-    async fn browser_config_default_disabled() {
+    async fn browser_config_default_enabled() {
         let b = BrowserConfig::default();
-        assert!(!b.enabled);
-        assert!(b.allowed_domains.is_empty());
+        assert!(b.enabled);
+        assert_eq!(b.allowed_domains, vec!["*"]);
         assert_eq!(b.backend, "agent_browser");
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -6227,8 +6260,8 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(!parsed.browser.enabled);
-        assert!(parsed.browser.allowed_domains.is_empty());
+        assert!(parsed.browser.enabled);
+        assert_eq!(parsed.browser.allowed_domains, vec!["*"]);
     }
 
     // ── Environment variable overrides (Docker support) ─────────
@@ -6340,7 +6373,7 @@ requires_openai_auth = true
     async fn env_override_open_skills_enabled_and_dir() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        assert!(!config.skills.open_skills_enabled);
+        assert!(config.skills.open_skills_enabled);
         assert!(config.skills.open_skills_dir.is_none());
         assert_eq!(
             config.skills.prompt_injection_mode,
@@ -6991,7 +7024,7 @@ default_model = "legacy-model"
 
         std::env::set_var("FREECLAW_TEMPERATURE", "0.5");
         config.apply_env_overrides();
-        assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
+        assert_eq!(config.default_temperature, Some(0.5));
 
         std::env::remove_var("FREECLAW_TEMPERATURE");
     }
@@ -7009,7 +7042,7 @@ default_model = "legacy-model"
         std::env::set_var("FREECLAW_TEMPERATURE", "3.0");
         config.apply_env_overrides();
         assert!(
-            (config.default_temperature - original_temp).abs() < f64::EPSILON,
+            config.default_temperature == original_temp,
             "Temperature 3.0 should be ignored (out of range)"
         );
 
@@ -7020,7 +7053,7 @@ default_model = "legacy-model"
     async fn env_override_reasoning_enabled() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        assert_eq!(config.runtime.reasoning_enabled, None);
+        assert_eq!(config.runtime.reasoning_enabled, Some(true));
 
         std::env::set_var("FREECLAW_REASONING_ENABLED", "false");
         config.apply_env_overrides();
@@ -7495,7 +7528,7 @@ default_model = "legacy-model"
             "test setup requires world-readable config"
         );
 
-        config.default_temperature = 0.6;
+        config.default_temperature = Some(0.6);
         config.save().await.unwrap();
 
         let hardened_mode = std::fs::metadata(&config_path)

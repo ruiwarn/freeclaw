@@ -22,6 +22,7 @@ pub struct GlmProvider {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
 }
 

@@ -4,6 +4,11 @@ use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
+/// Treat NaN as "unset temperature" so provider requests can omit the field.
+pub fn is_unset_temperature(value: &f64) -> bool {
+    value.is_nan()
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {

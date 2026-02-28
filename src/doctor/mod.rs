@@ -475,22 +475,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Temperature range
-    if config.default_temperature >= 0.0 && config.default_temperature <= 2.0 {
-        items.push(DiagItem::ok(
+    match config.default_temperature {
+        Some(temp) if (0.0..=2.0).contains(&temp) => items.push(DiagItem::ok(
             cat,
-            format!(
-                "temperature {:.1} (valid range 0.0–2.0)",
-                config.default_temperature
-            ),
-        ));
-    } else {
-        items.push(DiagItem::error(
+            format!("temperature {:.1} (valid range 0.0–2.0)", temp),
+        )),
+        Some(temp) => items.push(DiagItem::error(
             cat,
-            format!(
-                "temperature {:.1} is out of range (expected 0.0–2.0)",
-                config.default_temperature
-            ),
-        ));
+            format!("temperature {:.1} is out of range (expected 0.0–2.0)", temp),
+        )),
+        None => items.push(DiagItem::ok(
+            cat,
+            "temperature unset (using provider default)".to_string(),
+        )),
     }
 
     // Gateway port range
@@ -1062,7 +1059,7 @@ mod tests {
     #[test]
     fn config_validation_catches_bad_temperature() {
         let mut config = Config::default();
-        config.default_temperature = 5.0;
+        config.default_temperature = Some(5.0);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
@@ -1073,7 +1070,7 @@ mod tests {
     #[test]
     fn config_validation_accepts_valid_temperature() {
         let mut config = Config::default();
-        config.default_temperature = 0.7;
+        config.default_temperature = Some(0.7);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));

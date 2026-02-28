@@ -79,9 +79,9 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 - Hỗ trợ cross-region inference profiles (ví dụ: `us.anthropic.claude-*`).
 - Model ID dùng định dạng Bedrock: `anthropic.claude-sonnet-4-6`, `anthropic.claude-opus-4-6-v1`, v.v.
 
-### Bật/tắt tính năng Reasoning của Ollama
+### Bật/tắt Reasoning ở Runtime
 
-Bạn có thể kiểm soát hành vi reasoning/thinking của Ollama từ `config.toml`:
+Bạn có thể kiểm soát hành vi reasoning/thinking phía provider từ `config.toml`:
 
 ```toml
 [runtime]
@@ -90,9 +90,13 @@ reasoning_enabled = false
 
 Hành vi:
 
-- `false`: gửi `think: false` đến các yêu cầu Ollama `/api/chat`.
-- `true`: gửi `think: true`.
-- Không đặt: bỏ qua `think` và giữ nguyên mặc định của Ollama/model.
+- `ollama`: ánh xạ sang `think` trên `/api/chat` (`false` -> `think: false`, `true` -> `think: true`).
+- `anthropic` và `anthropic-custom:*`: khi `true`, gửi `thinking: { type: "enabled", budget_tokens: 1024 }`.
+- `openai` và `openrouter`: khi `true`, gửi `reasoning_effort: "high"`.
+- Nhóm provider OpenAI-compatible (ví dụ `qwen`, `qwen-code`, `kimi-code`):
+  - Endpoint tương thích DashScope/Qwen/Kimi gửi `enable_thinking: <bool>`.
+  - Endpoint compatible khác gửi `reasoning_effort: "high"` khi `true`.
+- Mặc định đã bật (`true`). Đặt `reasoning_enabled = false` để tắt reasoning phía provider.
 
 ### Ghi chú về Kimi Code
 

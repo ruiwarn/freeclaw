@@ -365,6 +365,7 @@ enum SystemBlock {
 #[serde(rename_all = "camelCase")]
 struct InferenceConfig {
     max_tokens: u32,
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
 }
 

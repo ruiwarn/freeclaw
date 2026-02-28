@@ -330,7 +330,7 @@ impl Agent {
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
-            .temperature(config.default_temperature)
+            .temperature(config.default_temperature.unwrap_or(f64::NAN))
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
@@ -611,7 +611,7 @@ pub async fn run(
     if let Some(m) = model_override {
         effective_config.default_model = Some(m);
     }
-    effective_config.default_temperature = temperature;
+    effective_config.default_temperature = Some(temperature);
 
     let mut agent = Agent::from_config(&effective_config)?;
 

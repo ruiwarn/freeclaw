@@ -41,16 +41,29 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 
 When running `freeclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
 
-- `/models` — show available providers and current selection
+- `/models` or `/models list` — show available providers and current selection
+- `/models status` — show current provider/model only
 - `/models <provider>` — switch provider for the current sender session
-- `/model` — show current model and cached model IDs (if available)
+- `/model` or `/model list` — show current model and cached model IDs (if available)
+- `/model status` — show current provider/model only
+- `/model <number>` — switch model by cached list index
 - `/model <model-id>` — switch model for the current sender session
-- `/new` — clear conversation history and start a fresh session
+- `/status` — show full sender-scoped runtime status (provider/model/defaults/memory/session/cache)
+- `/memory clean` — preview sender-scoped autosaved conversation memories that can be treated as noise
+- `/memory clean current` — explicit alias of `/memory clean`
+- `/memory clean confirm` — delete the previewed sender-scoped conversation memories
+- `/memory clean current confirm` — explicit alias of `/memory clean confirm`
+- `/memory clean all` — preview all memory entries across categories/sessions
+- `/memory clean all confirm` — delete all previewed memory entries
+- `/new` — archive current sender conversation history, then start a fresh session
+- `/reset` — clear current sender conversation history without archiving
 
 Notes:
 
 - Switching provider or model clears only that sender's in-memory conversation history to avoid cross-model context contamination.
-- `/new` clears the sender's conversation history without changing provider or model selection.
+- `/memory clean` requires explicit confirmation via `/memory clean confirm` before deletion.
+- `/memory clean all` requires explicit confirmation via `/memory clean all confirm` before deletion.
+- `/new` and `/reset` do not change provider/model selection; only session history state.
 - Model cache previews come from `freeclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 

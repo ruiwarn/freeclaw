@@ -35,7 +35,7 @@ fn config_default_has_expected_model() {
 fn config_default_temperature_positive() {
     let config = Config::default();
     assert!(
-        config.default_temperature > 0.0,
+        config.default_temperature.is_some_and(|temp| temp > 0.0),
         "default temperature should be positive"
     );
 }
@@ -122,14 +122,14 @@ fn config_toml_roundtrip_preserves_provider() {
     let mut config = Config::default();
     config.default_provider = Some("deepseek".into());
     config.default_model = Some("deepseek-chat".into());
-    config.default_temperature = 0.5;
+    config.default_temperature = Some(0.5);
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
 
     assert_eq!(parsed.default_provider.as_deref(), Some("deepseek"));
     assert_eq!(parsed.default_model.as_deref(), Some("deepseek-chat"));
-    assert!((parsed.default_temperature - 0.5).abs() < f64::EPSILON);
+    assert_eq!(parsed.default_temperature, Some(0.5));
 }
 
 #[test]

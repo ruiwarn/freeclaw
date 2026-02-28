@@ -63,6 +63,7 @@ pub mod peripherals;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
+pub(crate) mod priority_prompt;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;

@@ -1,5 +1,6 @@
 use crate::config::IdentityConfig;
 use crate::identity;
+use crate::priority_prompt::ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
@@ -50,6 +51,8 @@ impl SystemPromptBuilder {
 
     pub fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut output = String::new();
+        output.push_str(ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX);
+        output.push_str("\n\n");
         for section in &self.sections {
             let part = section.build(ctx)?;
             if part.trim().is_empty() {

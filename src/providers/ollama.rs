@@ -20,7 +20,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     stream: bool,
-    options: Options,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<Options>,
     #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +56,7 @@ struct OutgoingFunction {
 
 #[derive(Debug, Serialize)]
 struct Options {
+    #[serde(skip_serializing_if = "crate::providers::traits::is_unset_temperature")]
     temperature: f64,
 }
 
@@ -210,7 +212,11 @@ impl OllamaProvider {
             model: model.to_string(),
             messages,
             stream: false,
-            options: Options { temperature },
+            options: if temperature.is_nan() {
+                None
+            } else {
+                Some(Options { temperature })
+            },
             think: self.reasoning_enabled,
             tools: tools.map(|t| t.to_vec()),
         }
@@ -844,6 +850,26 @@ mod tests {
 
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn request_omits_options_when_temperature_is_unset() {
+        let provider = OllamaProvider::new(None, None);
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            f64::NAN,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        assert!(json.get("options").is_none());
     }
 
     #[test]

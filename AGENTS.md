@@ -265,6 +265,22 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Introduce new shared abstractions only after repeated use (rule-of-three), with at least one real caller in current scope.
 - For config/schema changes, treat keys as public contract: document defaults, compatibility impact, and migration/rollback path.
 
+### 6.5 Local Update Workflow (Required for `main` Runtime Refresh)
+
+When maintainers ask to refresh local runtime on the main workspace, follow this exact sequence unless explicitly overridden:
+
+1. `cd ~/github/freeclaw`
+2. `git pull`
+3. `cargo build --release`
+4. `cargo install --path /Users/wangrui/github/freeclaw --force`
+5. `freeclaw service restart`
+
+Execution rules:
+
+- Run in the listed order without adding detours.
+- If any step fails, report the exact failing command and reason, then stop.
+- For runtime-surface changes, ensure `/status` exposes at least version, effective provider/model, reasoning state, and temperature.
+
 ## 7) Change Playbooks
 
 ### 7.1 Adding a Provider

@@ -135,7 +135,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_provider: Some(provider),
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
+        default_temperature: Some(0.7),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
@@ -486,7 +486,7 @@ async fn run_quick_setup_with_home(
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
+        default_temperature: Some(0.7),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         security: crate::config::SecurityConfig::default(),
@@ -1867,10 +1867,11 @@ pub async fn run_models_status(config: &Config) -> Result<()> {
     println!();
     println!("  Provider:  {}", style(provider).cyan());
     println!("  Model:     {}", style(model).cyan());
-    println!(
-        "  Temp:      {}",
-        style(format!("{:.1}", config.default_temperature)).cyan()
-    );
+    let temp_display = config
+        .default_temperature
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "provider-default".to_string());
+    println!("  Temp:      {}", style(temp_display).cyan());
 
     match load_any_cached_models_for_provider(&config.workspace_dir, provider).await? {
         Some(cached) => {
@@ -5748,7 +5749,7 @@ mod tests {
     #[test]
     fn apply_provider_update_preserves_non_provider_settings() {
         let mut config = Config::default();
-        config.default_temperature = 1.23;
+        config.default_temperature = Some(1.23);
         config.memory.backend = "markdown".to_string();
         config.skills.open_skills_enabled = true;
         config.channels_config.cli = false;
@@ -5768,7 +5769,7 @@ mod tests {
             config.api_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
-        assert_eq!(config.default_temperature, 1.23);
+        assert_eq!(config.default_temperature, Some(1.23));
         assert_eq!(config.memory.backend, "markdown");
         assert!(config.skills.open_skills_enabled);
         assert!(!config.channels_config.cli);

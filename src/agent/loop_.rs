@@ -3422,7 +3422,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         observer.as_ref(),
         provider_name,
         &model_name,
-        config.default_temperature,
+        config.default_temperature.unwrap_or(f64::NAN),
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,

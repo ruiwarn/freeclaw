@@ -136,11 +136,22 @@ Notes:
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
-- `/models`
-- `/models <provider>`
-- `/model`
-- `/model <model-id>`
-- `/new`
+- `/models` or `/models list` (show provider list)
+- `/models status` (show current provider/model)
+- `/models <provider>` (switch provider for current sender session)
+- `/model` or `/model list` (show current model and cached model list)
+- `/model status` (show current provider/model)
+- `/model <number>` (switch by cached model index)
+- `/model <model-id>` (switch by model ID)
+- `/status` (show full sender-scoped runtime status)
+- `/memory clean` (preview sender-scoped autosaved conversation memories)
+- `/memory clean current` (explicit alias of `/memory clean`)
+- `/memory clean confirm` (delete the previewed sender-scoped conversation memories)
+- `/memory clean current confirm` (explicit alias of `/memory clean confirm`)
+- `/memory clean all` (preview all memory entries across categories/sessions)
+- `/memory clean all confirm` (delete all previewed memory entries)
+- `/new` (archive current sender session log, then start a new session)
+- `/reset` (start a new session without archiving log)
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`

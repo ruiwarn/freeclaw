@@ -88,10 +88,22 @@ Xác minh lần cuối: **2026-02-20**.
 
 Lệnh trong chat khi runtime đang chạy (Telegram/Discord):
 
-- `/models`
-- `/models <provider>`
-- `/model`
-- `/model <model-id>`
+- `/models` hoặc `/models list` (hiển thị danh sách provider)
+- `/models status` (hiển thị provider/model hiện tại)
+- `/models <provider>` (chuyển provider cho phiên người gửi hiện tại)
+- `/model` hoặc `/model list` (hiển thị model hiện tại và danh sách model đã cache)
+- `/model status` (hiển thị provider/model hiện tại)
+- `/model <number>` (chuyển model theo số thứ tự trong danh sách cache)
+- `/model <model-id>` (chuyển model theo ID)
+- `/status` (hiển thị trạng thái runtime đầy đủ theo phiên người gửi)
+- `/memory clean` (xem trước các bản ghi hội thoại tự lưu theo phạm vi người gửi để dọn nhiễu)
+- `/memory clean current` (bí danh tường minh của `/memory clean`)
+- `/memory clean confirm` (xóa các bản ghi đã xem trước ở bước `/memory clean`)
+- `/memory clean current confirm` (bí danh tường minh của `/memory clean confirm`)
+- `/memory clean all` (xem trước toàn bộ bản ghi memory ở mọi category/session)
+- `/memory clean all confirm` (xóa toàn bộ bản ghi đã xem trước)
+- `/new` (lưu log hội thoại hiện tại rồi bắt đầu phiên mới)
+- `/reset` (bắt đầu phiên mới mà không lưu log)
 
 Channel runtime cũng theo dõi `config.toml` và tự động áp dụng thay đổi cho:
 - `default_provider`
