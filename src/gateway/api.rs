@@ -87,7 +87,7 @@ pub async fn handle_api_status(
     }
 
     let body = serde_json::json!({
-        "provider": config.default_provider,
+        "provider": config.resolved_default_provider(),
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,

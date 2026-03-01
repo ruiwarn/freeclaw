@@ -80,10 +80,16 @@ pub struct Config {
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
     #[serde(alias = "model")]
     pub default_model: Option<String>,
+    /// User-friendly model configuration (`[models]`) with primary + fallback chains.
+    #[serde(default)]
+    pub models: ModelsConfig,
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
-    /// Default model temperature (0.0–2.0). Default: `0.7`.
+    /// Default model temperature (0.0–2.0).
+    ///
+    /// `None` means "do not force a global temperature"; providers/models use
+    /// their own native defaults unless overridden per request.
     #[serde(default)]
     pub default_temperature: Option<f64>,
 
@@ -229,6 +235,9 @@ pub struct ModelProviderConfig {
     /// Optional base URL for OpenAI-compatible endpoints.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Optional API key bound to this provider profile.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,
@@ -2098,11 +2107,16 @@ pub struct RuntimeConfig {
     pub docker: DockerRuntimeConfig,
 
     /// Global reasoning override for providers that expose explicit controls.
-    /// - `Some(true)` (default): request reasoning/thinking when supported
+    /// - `Some(true)`: request reasoning/thinking when supported
     /// - `Some(false)`: disable reasoning/thinking when supported
-    /// - `None`: legacy/manual state (providers handle their own defaults)
+    /// - `None`: do not force an override; providers handle defaults
     #[serde(default = "default_reasoning_enabled")]
     pub reasoning_enabled: Option<bool>,
+
+    /// Global reasoning level for providers that expose explicit controls.
+    /// Supported values: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`.
+    #[serde(default = "default_reasoning_level")]
+    pub reasoning_level: String,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -2161,6 +2175,10 @@ fn default_reasoning_enabled() -> Option<bool> {
     Some(true)
 }
 
+fn default_reasoning_level() -> String {
+    "medium".into()
+}
+
 impl Default for DockerRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -2181,6 +2199,7 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: default_reasoning_enabled(),
+            reasoning_level: default_reasoning_level(),
         }
     }
 }
@@ -2205,10 +2224,18 @@ pub struct ReliabilityConfig {
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
     pub api_keys: Vec<String>,
+    /// Per-provider API key overrides used by routed/fallback providers.
+    #[serde(default)]
+    pub provider_api_keys: std::collections::HashMap<String, String>,
     /// Per-model fallback chains. When a model fails, try these alternatives in order.
     /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
     #[serde(default)]
     pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
+    /// Per-model provider+model fallback chains.
+    /// Each entry keeps provider/model pairing so failover doesn't
+    /// attempt unsupported providers for a given model.
+    #[serde(default)]
+    pub model_provider_fallbacks: std::collections::HashMap<String, Vec<ProviderModelFallback>>,
     /// Initial backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_secs")]
     pub channel_initial_backoff_secs: u64,
@@ -2221,6 +2248,13 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+}
+
+/// A concrete provider/model fallback target.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderModelFallback {
+    pub provider: String,
+    pub model: String,
 }
 
 fn default_provider_retries() -> u32 {
@@ -2254,7 +2288,9 @@ impl Default for ReliabilityConfig {
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
@@ -2299,6 +2335,35 @@ impl Default for SchedulerConfig {
             max_concurrent: default_scheduler_max_concurrent(),
         }
     }
+}
+
+// ── Unified model config ────────────────────────────────────────
+
+/// User-friendly model configuration (`[models]`) inspired by OpenClaw-style
+/// primary/fallback model refs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ModelsConfig {
+    /// Default model chain used when no scenario route hint is selected.
+    #[serde(default)]
+    pub default: ModelSelectionConfig,
+    /// Scenario route chains keyed by hint name.
+    ///
+    /// Example:
+    /// `[models.routes.coding]`
+    /// `primary = "openai/gpt-5.3-codex"`
+    #[serde(default)]
+    pub routes: HashMap<String, ModelSelectionConfig>,
+}
+
+/// Primary model + ordered fallback model refs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ModelSelectionConfig {
+    /// Primary model ref (`provider/model`) or raw model id.
+    #[serde(default)]
+    pub primary: Option<String>,
+    /// Ordered fallback model refs.
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
 }
 
 // ── Model routing ────────────────────────────────────────────────
@@ -3599,8 +3664,9 @@ impl Default for Config {
             api_url: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            models: ModelsConfig::default(),
             model_providers: HashMap::new(),
-            default_temperature: Some(0.7),
+            default_temperature: None,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
@@ -3986,6 +4052,54 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
         })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedModelRef {
+    provider: Option<String>,
+    model: String,
+}
+
+fn parse_model_ref(raw: &str) -> Option<ParsedModelRef> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Providers like `custom:https://.../v1` embed `://` and additional `/`.
+    // For these refs, split on the final `/` to preserve the full provider URL.
+    let uses_url_provider =
+        trimmed.contains("://") && (trimmed.starts_with("custom:") || trimmed.contains("-custom:"));
+    if uses_url_provider {
+        if let Some((provider, model)) = trimmed.rsplit_once('/') {
+            let provider = provider.trim();
+            let model = model.trim();
+            if provider.is_empty() || model.is_empty() {
+                return None;
+            }
+            return Some(ParsedModelRef {
+                provider: Some(provider.to_string()),
+                model: model.to_string(),
+            });
+        }
+    }
+
+    if let Some((provider, model)) = trimmed.split_once('/') {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() {
+            return None;
+        }
+        return Some(ParsedModelRef {
+            provider: Some(provider.to_string()),
+            model: model.to_string(),
+        });
+    }
+
+    Some(ParsedModelRef {
+        provider: None,
+        model: trimmed.to_string(),
+    })
+}
+
 fn normalize_wire_api(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "responses" => Some("responses"),
@@ -4011,6 +4125,475 @@ fn read_codex_openai_api_key() -> Option<String> {
 }
 
 impl Config {
+    fn sync_legacy_defaults_from_models_primary(&mut self) {
+        let Some(primary) = self
+            .models
+            .default
+            .primary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+
+        let current_provider_uses_url = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|provider| {
+                provider.contains("://")
+                    && (provider.starts_with("custom:") || provider.contains("-custom:"))
+            });
+        let primary_is_url_provider_ref = primary.contains("://")
+            && (primary.starts_with("custom:") || primary.contains("-custom:"));
+        if current_provider_uses_url && !primary_is_url_provider_ref {
+            self.default_model = Some(primary.to_string());
+            return;
+        }
+
+        let Some(parsed) = parse_model_ref(primary) else {
+            return;
+        };
+
+        if let Some(provider) = parsed.provider {
+            self.default_provider = Some(provider);
+        }
+        self.default_model = Some(parsed.model);
+    }
+
+    pub(crate) fn sync_models_primary_from_legacy_defaults(&mut self) {
+        let provider = self.default_provider.as_deref().map(str::trim);
+        let model = self.default_model.as_deref().map(str::trim);
+        let next_primary = match (provider, model) {
+            (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+                let provider_uses_url = provider.contains("://")
+                    && (provider.starts_with("custom:") || provider.contains("-custom:"));
+                if provider_uses_url {
+                    Some(model.to_string())
+                } else {
+                    Some(format!("{provider}/{model}"))
+                }
+            }
+            (None, Some(model)) if !model.is_empty() => Some(model.to_string()),
+            _ => None,
+        };
+        self.models.default.primary = next_primary;
+    }
+
+    fn upsert_fallback_mapping(
+        model_fallbacks: &mut HashMap<String, Vec<String>>,
+        primary_model: &str,
+        fallback_model: &str,
+    ) {
+        if primary_model.trim().is_empty() || fallback_model.trim().is_empty() {
+            return;
+        }
+
+        let entry = model_fallbacks
+            .entry(primary_model.to_string())
+            .or_default();
+        if !entry.iter().any(|existing| existing == fallback_model) {
+            entry.push(fallback_model.to_string());
+        }
+    }
+
+    fn upsert_provider_model_fallback_mapping(
+        model_provider_fallbacks: &mut HashMap<String, Vec<ProviderModelFallback>>,
+        primary_model: &str,
+        fallback_provider: &str,
+        fallback_model: &str,
+    ) {
+        let primary_model = primary_model.trim();
+        let fallback_provider = fallback_provider.trim();
+        let fallback_model = fallback_model.trim();
+        if primary_model.is_empty() || fallback_provider.is_empty() || fallback_model.is_empty() {
+            return;
+        }
+
+        let entry = model_provider_fallbacks
+            .entry(primary_model.to_string())
+            .or_default();
+        if entry.iter().any(|existing| {
+            existing.provider == fallback_provider && existing.model == fallback_model
+        }) {
+            return;
+        }
+        entry.push(ProviderModelFallback {
+            provider: fallback_provider.to_string(),
+            model: fallback_model.to_string(),
+        });
+    }
+
+    fn push_unique_provider(targets: &mut Vec<String>, provider: &str, primary_provider: &str) {
+        let provider = provider.trim();
+        if provider.is_empty() || provider.eq_ignore_ascii_case(primary_provider) {
+            return;
+        }
+        if !targets.iter().any(|existing| existing == provider) {
+            targets.push(provider.to_string());
+        }
+    }
+
+    fn parse_fallback_target(fallback: &str, primary_provider: &str) -> Option<(String, String)> {
+        let parsed = parse_model_ref(fallback)?;
+        let fallback_provider = parsed
+            .provider
+            .unwrap_or_else(|| primary_provider.to_string());
+        Some((fallback_provider, parsed.model))
+    }
+
+    fn provider_profile_api_key(
+        model_providers: &HashMap<String, ModelProviderConfig>,
+        provider: &str,
+    ) -> Option<String> {
+        let needle = provider.trim();
+        if needle.is_empty() {
+            return None;
+        }
+
+        model_providers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(needle))
+            .and_then(|(_, profile)| profile.api_key.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn upsert_provider_api_key(
+        provider_api_keys: &mut HashMap<String, String>,
+        provider: &str,
+        api_key: &str,
+    ) {
+        let provider = provider.trim();
+        let api_key = api_key.trim();
+        if provider.is_empty() || api_key.is_empty() {
+            return;
+        }
+        provider_api_keys.insert(provider.to_string(), api_key.to_string());
+    }
+
+    fn resolve_runtime_provider_from_profile_with_map(
+        model_providers: &HashMap<String, ModelProviderConfig>,
+        provider: &str,
+    ) -> String {
+        let trimmed = provider.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        if trimmed.starts_with("custom:") || trimmed.starts_with("anthropic-custom:") {
+            return trimmed.to_string();
+        }
+
+        let Some((profile_key, profile)) = model_providers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(trimmed))
+            .map(|(name, profile)| (name.clone(), profile.clone()))
+        else {
+            return trimmed.to_string();
+        };
+
+        let profile_name = profile
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(profile_key.as_str());
+        let base_url = profile
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(base_url) = base_url {
+            let lower_name = profile_name.to_ascii_lowercase();
+            if lower_name == "anthropic" || lower_name.contains("anthropic") {
+                return format!("anthropic-custom:{base_url}");
+            }
+            return format!("custom:{base_url}");
+        }
+
+        if profile_name.eq_ignore_ascii_case(&profile_key) {
+            profile_key
+        } else {
+            profile_name.to_string()
+        }
+    }
+
+    fn resolve_runtime_provider_from_profile(&self, provider: &str) -> String {
+        Self::resolve_runtime_provider_from_profile_with_map(&self.model_providers, provider)
+    }
+
+    fn apply_default_provider_profile_key_to_reliability(&mut self) {
+        let Some(primary_provider) = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+
+        let resolved_primary_provider =
+            self.resolve_runtime_provider_from_profile(primary_provider);
+        let Some(api_key) = Self::provider_profile_api_key(&self.model_providers, primary_provider)
+        else {
+            return;
+        };
+        Self::upsert_provider_api_key(
+            &mut self.reliability.provider_api_keys,
+            &resolved_primary_provider,
+            &api_key,
+        );
+    }
+
+    fn apply_models_default_fallbacks_to_reliability(&mut self) {
+        let Some(primary_provider) = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let Some(primary_model) = self
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let resolved_primary_provider =
+            self.resolve_runtime_provider_from_profile(primary_provider);
+        let mut ordered_candidates: Vec<(String, String)> =
+            vec![(resolved_primary_provider.clone(), primary_model.to_string())];
+        if let Some(primary_api_key) =
+            Self::provider_profile_api_key(&self.model_providers, primary_provider)
+        {
+            Self::upsert_provider_api_key(
+                &mut self.reliability.provider_api_keys,
+                &resolved_primary_provider,
+                &primary_api_key,
+            );
+        }
+
+        for fallback in &self.models.default.fallbacks {
+            let Some((fallback_provider, fallback_model)) =
+                Self::parse_fallback_target(fallback, primary_provider)
+            else {
+                continue;
+            };
+            let resolved_fallback_provider =
+                self.resolve_runtime_provider_from_profile(&fallback_provider);
+            if let Some(fallback_api_key) =
+                Self::provider_profile_api_key(&self.model_providers, &fallback_provider)
+            {
+                Self::upsert_provider_api_key(
+                    &mut self.reliability.provider_api_keys,
+                    &resolved_fallback_provider,
+                    &fallback_api_key,
+                );
+            }
+            Self::push_unique_provider(
+                &mut self.reliability.fallback_providers,
+                &resolved_fallback_provider,
+                &resolved_primary_provider,
+            );
+            Self::upsert_fallback_mapping(
+                &mut self.reliability.model_fallbacks,
+                primary_model,
+                &fallback_model,
+            );
+            Self::upsert_provider_model_fallback_mapping(
+                &mut self.reliability.model_provider_fallbacks,
+                primary_model,
+                &resolved_fallback_provider,
+                &fallback_model,
+            );
+            ordered_candidates.push((resolved_fallback_provider, fallback_model));
+        }
+
+        // Preserve fallback pairing for non-primary models by projecting the
+        // ordered defaults chain into per-model provider/model candidates.
+        for i in 0..ordered_candidates.len() {
+            let (_, current_model) = &ordered_candidates[i];
+            for (next_provider, next_model) in &ordered_candidates[i + 1..] {
+                Self::upsert_provider_model_fallback_mapping(
+                    &mut self.reliability.model_provider_fallbacks,
+                    current_model,
+                    next_provider,
+                    next_model,
+                );
+            }
+        }
+    }
+
+    fn apply_models_routes_to_legacy_and_reliability(&mut self) {
+        if self.models.routes.is_empty() {
+            return;
+        }
+
+        let fallback_provider = self
+            .default_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("openrouter")
+            .to_string();
+
+        for (hint, selection) in &self.models.routes {
+            let hint = hint.trim();
+            if hint.is_empty() {
+                continue;
+            }
+            let Some(primary_raw) = selection
+                .primary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(primary_ref) = parse_model_ref(primary_raw) else {
+                continue;
+            };
+
+            let provider = primary_ref
+                .provider
+                .unwrap_or_else(|| fallback_provider.clone());
+            let resolved_provider = self.resolve_runtime_provider_from_profile(&provider);
+            let profile_api_key = Self::provider_profile_api_key(&self.model_providers, &provider);
+            if let Some(api_key) = profile_api_key.as_deref() {
+                Self::upsert_provider_api_key(
+                    &mut self.reliability.provider_api_keys,
+                    &resolved_provider,
+                    api_key,
+                );
+            }
+            let model = primary_ref.model;
+
+            let mut route = self
+                .model_routes
+                .iter()
+                .find(|existing| existing.hint == hint)
+                .cloned()
+                .unwrap_or(ModelRouteConfig {
+                    hint: hint.to_string(),
+                    provider: resolved_provider.clone(),
+                    model: model.clone(),
+                    api_key: None,
+                });
+
+            route.provider = resolved_provider.clone();
+            route.model = model.clone();
+            if route
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+            {
+                route.api_key = profile_api_key.clone();
+            }
+            self.model_routes.retain(|existing| existing.hint != hint);
+            self.model_routes.push(route);
+
+            for fallback in &selection.fallbacks {
+                let Some((fallback_provider_name, fallback_model)) =
+                    Self::parse_fallback_target(fallback, &provider)
+                else {
+                    continue;
+                };
+                let resolved_fallback_provider =
+                    self.resolve_runtime_provider_from_profile(&fallback_provider_name);
+                if let Some(fallback_api_key) =
+                    Self::provider_profile_api_key(&self.model_providers, &fallback_provider_name)
+                {
+                    Self::upsert_provider_api_key(
+                        &mut self.reliability.provider_api_keys,
+                        &resolved_fallback_provider,
+                        &fallback_api_key,
+                    );
+                }
+                Self::push_unique_provider(
+                    &mut self.reliability.fallback_providers,
+                    &resolved_fallback_provider,
+                    &resolved_provider,
+                );
+                Self::upsert_fallback_mapping(
+                    &mut self.reliability.model_fallbacks,
+                    &model,
+                    &fallback_model,
+                );
+                Self::upsert_provider_model_fallback_mapping(
+                    &mut self.reliability.model_provider_fallbacks,
+                    &model,
+                    &resolved_fallback_provider,
+                    &fallback_model,
+                );
+            }
+        }
+
+        self.model_routes.sort_by(|a, b| a.hint.cmp(&b.hint));
+    }
+
+    fn apply_model_routes_profile_compat(&mut self) {
+        let providers = self.model_providers.clone();
+        for route in &mut self.model_routes {
+            let original_provider = route.provider.clone();
+            let resolved_provider = Self::resolve_runtime_provider_from_profile_with_map(
+                &providers,
+                &original_provider,
+            );
+            route.provider = resolved_provider.clone();
+
+            if route
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+            {
+                route.api_key =
+                    Self::provider_profile_api_key(&self.model_providers, &original_provider);
+            }
+
+            if let Some(profile_api_key) =
+                Self::provider_profile_api_key(&self.model_providers, &original_provider)
+            {
+                Self::upsert_provider_api_key(
+                    &mut self.reliability.provider_api_keys,
+                    &resolved_provider,
+                    &profile_api_key,
+                );
+            }
+        }
+    }
+
+    fn apply_models_compat(&mut self) {
+        // 1) New shape wins over legacy fields when explicitly configured.
+        self.sync_legacy_defaults_from_models_primary();
+        // 2) Keep new shape synchronized for downstream UX/CLI output.
+        self.sync_models_primary_from_legacy_defaults();
+        // 3) Promote default provider profile credential for runtime resolution.
+        self.apply_default_provider_profile_key_to_reliability();
+        // 4) Materialize fallback chains into current runtime structures.
+        self.apply_models_default_fallbacks_to_reliability();
+        self.apply_models_routes_to_legacy_and_reliability();
+        self.apply_model_routes_profile_compat();
+    }
+
+    pub fn resolved_default_provider(&self) -> &str {
+        self.default_provider.as_deref().unwrap_or("openrouter")
+    }
+
+    pub fn resolved_default_model(&self) -> &str {
+        self.default_model
+            .as_deref()
+            .unwrap_or("anthropic/claude-sonnet-4.6")
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_freeclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -4098,6 +4681,13 @@ impl Config {
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
+            for provider in config.model_providers.values_mut() {
+                decrypt_optional_secret(
+                    &store,
+                    &mut provider.api_key,
+                    "config.model_providers.*.api_key",
+                )?;
+            }
 
             if let Some(ref mut ns) = config.channels_config.nostr {
                 decrypt_secret(
@@ -4183,6 +4773,22 @@ impl Config {
         {
             if let Some(base_url) = base_url.as_ref() {
                 self.api_url = Some(base_url.clone());
+            }
+        }
+
+        if self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty())
+        {
+            if let Some(profile_key) = profile
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                self.api_key = Some(profile_key.to_string());
             }
         }
 
@@ -4294,6 +4900,65 @@ impl Config {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
         }
 
+        // Unified model defaults
+        if let Some(primary) = self
+            .models
+            .default
+            .primary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if parse_model_ref(primary).is_none() {
+                anyhow::bail!(
+                    "models.default.primary must be a non-empty model ref (expected provider/model or model)"
+                );
+            }
+        }
+        for (i, fallback) in self.models.default.fallbacks.iter().enumerate() {
+            let fallback = fallback.trim();
+            if fallback.is_empty() {
+                anyhow::bail!("models.default.fallbacks[{i}] must not be empty");
+            }
+            if parse_model_ref(fallback).is_none() {
+                anyhow::bail!(
+                    "models.default.fallbacks[{i}] must be a model ref (expected provider/model or model)"
+                );
+            }
+        }
+
+        // Unified model routes
+        for (hint, route) in &self.models.routes {
+            let hint = hint.trim();
+            if hint.is_empty() {
+                anyhow::bail!("models.routes contains an empty hint key");
+            }
+            let Some(primary) = route
+                .primary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                anyhow::bail!("models.routes.{hint}.primary must not be empty");
+            };
+            if parse_model_ref(primary).is_none() {
+                anyhow::bail!(
+                    "models.routes.{hint}.primary must be a model ref (expected provider/model or model)"
+                );
+            }
+            for (i, fallback) in route.fallbacks.iter().enumerate() {
+                let fallback = fallback.trim();
+                if fallback.is_empty() {
+                    anyhow::bail!("models.routes.{hint}.fallbacks[{i}] must not be empty");
+                }
+                if parse_model_ref(fallback).is_none() {
+                    anyhow::bail!(
+                        "models.routes.{hint}.fallbacks[{i}] must be a model ref (expected provider/model or model)"
+                    );
+                }
+            }
+        }
+
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
@@ -4336,10 +5001,15 @@ impl Config {
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
+            let has_api_key = profile
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
 
-            if !has_name && !has_base_url {
+            if !has_name && !has_base_url && !has_api_key {
                 anyhow::bail!(
-                    "model_providers.{profile_name} must define at least one of `name` or `base_url`"
+                    "model_providers.{profile_name} must define at least one of `name`, `base_url`, or `api_key`"
                 );
             }
 
@@ -4396,6 +5066,8 @@ impl Config {
 
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
+        self.apply_models_compat();
+
         // API Key: FREECLAW_API_KEY or API_KEY (generic)
         if let Ok(key) = std::env::var("FREECLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
@@ -4453,6 +5125,7 @@ impl Config {
 
         // Apply named provider profile remapping (Codex app-server compatibility).
         self.apply_named_model_provider_profile();
+        self.apply_default_provider_profile_key_to_reliability();
 
         // Workspace directory: FREECLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("FREECLAW_WORKSPACE") {
@@ -4536,6 +5209,19 @@ impl Config {
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
                 "0" | "false" | "no" | "off" => self.runtime.reasoning_enabled = Some(false),
+                _ => {}
+            }
+        }
+
+        // Reasoning level override: FREECLAW_REASONING_LEVEL or REASONING_LEVEL
+        if let Ok(level) =
+            std::env::var("FREECLAW_REASONING_LEVEL").or_else(|_| std::env::var("REASONING_LEVEL"))
+        {
+            let normalized = level.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "off" | "minimal" | "low" | "medium" | "high" | "xhigh" => {
+                    self.runtime.reasoning_level = normalized
+                }
                 _ => {}
             }
         }
@@ -4671,6 +5357,11 @@ impl Config {
             self.proxy.services = normalize_service_list(vec![services_raw]);
         }
 
+        // Env overrides are highest precedence for runtime selection, so mirror
+        // the resulting legacy defaults back into [models] before final compat.
+        self.sync_models_primary_from_legacy_defaults();
+        self.apply_models_compat();
+
         if let Err(error) = self.proxy.validate() {
             tracing::warn!("Invalid proxy configuration ignored: {error}");
             self.proxy.enabled = false;
@@ -4686,6 +5377,7 @@ impl Config {
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
+        config_to_save.apply_models_compat();
         let freeclaw_dir = self
             .config_path
             .parent()
@@ -4719,6 +5411,13 @@ impl Config {
 
         for agent in config_to_save.agents.values_mut() {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+        }
+        for provider in config_to_save.model_providers.values_mut() {
+            encrypt_optional_secret(
+                &store,
+                &mut provider.api_key,
+                "config.model_providers.*.api_key",
+            )?;
         }
 
         if let Some(ref mut ns) = config_to_save.channels_config.nostr {
@@ -4866,7 +5565,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
         assert!(c.default_model.as_deref().unwrap().contains("claude"));
-        assert_eq!(c.default_temperature, Some(0.7));
+        assert_eq!(c.default_temperature, None);
         assert!(c.api_key.is_none());
         assert!(c.skills.open_skills_enabled);
         assert_eq!(
@@ -4974,6 +5673,7 @@ mod tests {
         assert!(r.docker.read_only_rootfs);
         assert!(r.docker.mount_workspace);
         assert_eq!(r.reasoning_enabled, Some(true));
+        assert_eq!(r.reasoning_level, "medium");
     }
 
     #[test]
@@ -5079,6 +5779,7 @@ default_temperature = 0.7
             api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
+            models: ModelsConfig::default(),
             model_providers: HashMap::new(),
             default_temperature: Some(0.5),
             observability: ObservabilityConfig {
@@ -5283,6 +5984,21 @@ reasoning_enabled = false
 
         let parsed: Config = toml::from_str(raw).unwrap();
         assert_eq!(parsed.runtime.reasoning_enabled, Some(false));
+        assert_eq!(parsed.runtime.reasoning_level, "medium");
+    }
+
+    #[test]
+    async fn runtime_reasoning_level_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[runtime]
+reasoning_level = "high"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.runtime.reasoning_enabled, Some(true));
+        assert_eq!(parsed.runtime.reasoning_level, "high");
     }
 
     #[test]
@@ -5341,6 +6057,7 @@ tool_dispatcher = "xml"
             api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
+            models: ModelsConfig::default(),
             model_providers: HashMap::new(),
             default_temperature: Some(0.9),
             observability: ObservabilityConfig::default(),
@@ -6370,6 +7087,249 @@ requires_openai_auth = true
     }
 
     #[test]
+    async fn models_default_primary_materializes_legacy_defaults_and_fallbacks() {
+        let raw = r#"
+[models.default]
+primary = "openai/gpt-5-mini"
+fallbacks = ["anthropic/claude-3-7-sonnet", "openai/gpt-4.1-mini"]
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(
+            config.models.default.primary.as_deref(),
+            Some("openai/gpt-5-mini")
+        );
+        assert!(
+            config
+                .reliability
+                .fallback_providers
+                .iter()
+                .any(|provider| provider == "anthropic"),
+            "cross-provider fallback should be promoted to reliability.fallback_providers"
+        );
+        assert_eq!(
+            config.reliability.model_fallbacks.get("gpt-5-mini"),
+            Some(&vec![
+                "claude-3-7-sonnet".to_string(),
+                "gpt-4.1-mini".to_string()
+            ])
+        );
+        assert_eq!(
+            config
+                .reliability
+                .model_provider_fallbacks
+                .get("gpt-5-mini"),
+            Some(&vec![
+                ProviderModelFallback {
+                    provider: "anthropic".to_string(),
+                    model: "claude-3-7-sonnet".to_string(),
+                },
+                ProviderModelFallback {
+                    provider: "openai".to_string(),
+                    model: "gpt-4.1-mini".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    async fn models_routes_materialize_model_routes_and_route_fallbacks() {
+        let raw = r#"
+[models.routes.coding]
+primary = "openai/gpt-5-codex"
+fallbacks = ["openrouter/anthropic/claude-sonnet-4.6"]
+
+[models.routes.fast]
+primary = "groq/llama-3.3-70b-versatile"
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+
+        let coding = config
+            .model_routes
+            .iter()
+            .find(|route| route.hint == "coding")
+            .expect("coding route should be materialized");
+        assert_eq!(coding.provider, "openai");
+        assert_eq!(coding.model, "gpt-5-codex");
+
+        let fast = config
+            .model_routes
+            .iter()
+            .find(|route| route.hint == "fast")
+            .expect("fast route should be materialized");
+        assert_eq!(fast.provider, "groq");
+        assert_eq!(fast.model, "llama-3.3-70b-versatile");
+
+        assert_eq!(
+            config.reliability.model_fallbacks.get("gpt-5-codex"),
+            Some(&vec!["anthropic/claude-sonnet-4.6".to_string()])
+        );
+        assert_eq!(
+            config
+                .reliability
+                .model_provider_fallbacks
+                .get("gpt-5-codex"),
+            Some(&vec![ProviderModelFallback {
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-sonnet-4.6".to_string(),
+            }])
+        );
+        assert!(
+            config
+                .reliability
+                .fallback_providers
+                .iter()
+                .any(|provider| provider == "openrouter"),
+            "route fallback provider should be propagated to reliability settings"
+        );
+    }
+
+    #[test]
+    async fn models_default_fallbacks_resolve_named_provider_profiles() {
+        let raw = r#"
+[model_providers.newcli-anthropic]
+name = "anthropic"
+base_url = "https://dm-fox.rjj.cc/claude/droid"
+
+[models.default]
+primary = "google/gemini-3-flash-preview"
+fallbacks = ["newcli-anthropic/claude-opus-4-6"]
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+
+        assert!(
+            config
+                .reliability
+                .fallback_providers
+                .iter()
+                .any(|provider| {
+                    provider == "anthropic-custom:https://dm-fox.rjj.cc/claude/droid"
+                }),
+            "named provider profile fallback should materialize to anthropic-custom endpoint"
+        );
+        assert_eq!(
+            config
+                .reliability
+                .model_fallbacks
+                .get("gemini-3-flash-preview"),
+            Some(&vec!["claude-opus-4-6".to_string()])
+        );
+        assert_eq!(
+            config
+                .reliability
+                .model_provider_fallbacks
+                .get("gemini-3-flash-preview"),
+            Some(&vec![ProviderModelFallback {
+                provider: "anthropic-custom:https://dm-fox.rjj.cc/claude/droid".to_string(),
+                model: "claude-opus-4-6".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    async fn models_routes_resolve_named_provider_profiles_for_route_and_fallbacks() {
+        let raw = r#"
+[model_providers.anyrouter]
+name = "anthropic"
+base_url = "https://anyrouter.top"
+
+[model_providers.newcli-anthropic]
+name = "anthropic"
+base_url = "https://dm-fox.rjj.cc/claude/droid"
+
+[models.routes.opus]
+primary = "newcli-anthropic/claude-opus-4-6"
+fallbacks = ["anyrouter/claude-opus-4-6"]
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+
+        let opus = config
+            .model_routes
+            .iter()
+            .find(|route| route.hint == "opus")
+            .expect("opus route should be materialized");
+        assert_eq!(
+            opus.provider,
+            "anthropic-custom:https://dm-fox.rjj.cc/claude/droid"
+        );
+        assert_eq!(opus.model, "claude-opus-4-6");
+        assert!(
+            config
+                .reliability
+                .fallback_providers
+                .iter()
+                .any(|provider| provider == "anthropic-custom:https://anyrouter.top"),
+            "route fallback named provider should be materialized to anthropic-custom endpoint"
+        );
+        assert_eq!(
+            config
+                .reliability
+                .model_provider_fallbacks
+                .get("claude-opus-4-6"),
+            Some(&vec![ProviderModelFallback {
+                provider: "anthropic-custom:https://anyrouter.top".to_string(),
+                model: "claude-opus-4-6".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    async fn models_default_primary_supports_custom_url_provider_refs() {
+        let raw = r#"
+[models.default]
+primary = "custom:https://proxy.example.com/v1/gpt-4.1-mini"
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("custom:https://proxy.example.com/v1")
+        );
+        assert_eq!(config.default_model.as_deref(), Some("gpt-4.1-mini"));
+    }
+
+    #[test]
+    async fn env_override_updates_models_primary_when_models_primary_is_already_set() {
+        let _env_guard = env_override_lock().await;
+        let mut config: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+
+[models.default]
+primary = "openrouter/anthropic/claude-sonnet-4.6"
+"#,
+        )
+        .expect("config should parse");
+
+        std::env::set_var("FREECLAW_PROVIDER", "openai");
+        std::env::set_var("FREECLAW_MODEL", "gpt-5-mini");
+        config.apply_env_overrides();
+
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(
+            config.models.default.primary.as_deref(),
+            Some("openai/gpt-5-mini")
+        );
+
+        std::env::remove_var("FREECLAW_PROVIDER");
+        std::env::remove_var("FREECLAW_MODEL");
+    }
+
+    #[test]
     async fn env_override_open_skills_enabled_and_dir() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -6521,6 +7481,7 @@ requires_openai_auth = true
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    api_key: None,
                     wire_api: None,
                     requires_openai_auth: false,
                 },
@@ -6549,6 +7510,7 @@ requires_openai_auth = true
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue".to_string()),
+                    api_key: None,
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
                 },
@@ -6564,6 +7526,99 @@ requires_openai_auth = true
         assert_eq!(config.default_provider.as_deref(), Some("openai-codex"));
         assert_eq!(config.api_url.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(config.api_key.as_deref(), Some("sk-test-codex-key"));
+    }
+
+    #[test]
+    async fn model_provider_profile_api_key_populates_reliability_provider_keys() {
+        let raw = r#"
+[model_providers.google]
+name = "google"
+api_key = "google-profile-key"
+
+[models.default]
+primary = "google/gemini-3-flash-preview"
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+        assert_eq!(
+            config
+                .reliability
+                .provider_api_keys
+                .get("google")
+                .map(String::as_str),
+            Some("google-profile-key")
+        );
+    }
+
+    #[test]
+    async fn models_route_profile_api_key_is_applied_to_route_and_fallback_provider() {
+        let raw = r#"
+[model_providers.newcli-anthropic]
+name = "anthropic"
+base_url = "https://dm-fox.rjj.cc/claude/droid"
+api_key = "anthropic-profile-key"
+
+[model_providers.anyrouter]
+name = "anthropic"
+base_url = "https://anyrouter.top"
+api_key = "anyrouter-profile-key"
+
+[models.routes.opus]
+primary = "newcli-anthropic/claude-opus-4-6"
+fallbacks = ["anyrouter/claude-opus-4-6"]
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+
+        let route = config
+            .model_routes
+            .iter()
+            .find(|route| route.hint == "opus")
+            .expect("opus route should be present");
+        assert_eq!(
+            route.provider,
+            "anthropic-custom:https://dm-fox.rjj.cc/claude/droid"
+        );
+        assert_eq!(route.api_key.as_deref(), Some("anthropic-profile-key"));
+        assert_eq!(
+            config
+                .reliability
+                .provider_api_keys
+                .get("anthropic-custom:https://anyrouter.top")
+                .map(String::as_str),
+            Some("anyrouter-profile-key")
+        );
+    }
+
+    #[test]
+    async fn legacy_model_routes_profile_provider_is_resolved_and_keyed() {
+        let raw = r#"
+[model_providers.newcli-anthropic]
+name = "anthropic"
+base_url = "https://dm-fox.rjj.cc/claude/droid"
+api_key = "anthropic-profile-key"
+
+[[model_routes]]
+hint = "opus"
+provider = "newcli-anthropic"
+model = "claude-opus-4-6"
+"#;
+
+        let mut config: Config = toml::from_str(raw).expect("config should parse");
+        config.apply_models_compat();
+
+        let route = config
+            .model_routes
+            .iter()
+            .find(|route| route.hint == "opus")
+            .expect("opus route should be present");
+        assert_eq!(
+            route.provider,
+            "anthropic-custom:https://dm-fox.rjj.cc/claude/droid"
+        );
+        assert_eq!(route.api_key.as_deref(), Some("anthropic-profile-key"));
     }
 
     #[test]
@@ -6611,6 +7666,7 @@ requires_openai_auth = true
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    api_key: None,
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
                 },
@@ -6622,6 +7678,27 @@ requires_openai_auth = true
         assert!(error
             .to_string()
             .contains("wire_api must be one of: responses, chat_completions"));
+    }
+
+    #[test]
+    async fn validate_accepts_model_provider_with_api_key_only() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            model_providers: HashMap::from([(
+                "google".to_string(),
+                ModelProviderConfig {
+                    name: None,
+                    base_url: None,
+                    api_key: Some("provider-key".to_string()),
+                    wire_api: None,
+                    requires_openai_auth: false,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let result = config.validate();
+        assert!(result.is_ok(), "expected api_key-only profile to be valid");
     }
 
     #[test]
@@ -7077,6 +8154,36 @@ default_model = "legacy-model"
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
         std::env::remove_var("FREECLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_reasoning_level() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.runtime.reasoning_level, "medium");
+
+        std::env::set_var("FREECLAW_REASONING_LEVEL", "high");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_level, "high");
+
+        std::env::set_var("FREECLAW_REASONING_LEVEL", "LOW");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_level, "low");
+
+        std::env::remove_var("FREECLAW_REASONING_LEVEL");
+    }
+
+    #[test]
+    async fn env_override_reasoning_level_invalid_value_ignored() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.runtime.reasoning_level = "medium".to_string();
+
+        std::env::set_var("FREECLAW_REASONING_LEVEL", "smartest");
+        config.apply_env_overrides();
+        assert_eq!(config.runtime.reasoning_level, "medium");
+
+        std::env::remove_var("FREECLAW_REASONING_LEVEL");
     }
 
     #[test]

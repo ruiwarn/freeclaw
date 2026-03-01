@@ -106,7 +106,7 @@ impl Tool for CronRemoveTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::config::Config;

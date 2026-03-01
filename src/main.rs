@@ -73,8 +73,8 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
-mod providers;
 mod priority_prompt;
+mod providers;
 mod runtime;
 mod security;
 mod service;
@@ -821,14 +821,8 @@ async fn main() -> Result<()> {
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
-            println!(
-                "🤖 Provider:      {}",
-                config.default_provider.as_deref().unwrap_or("openrouter")
-            );
-            println!(
-                "   Model:         {}",
-                config.default_model.as_deref().unwrap_or("(default)")
-            );
+            println!("🤖 Provider:      {}", config.resolved_default_provider());
+            println!("   Model:         {}", config.resolved_default_model());
             println!("📊 Observability:  {}", config.observability.backend);
             println!(
                 "🧾 Trace storage:  {} ({})",
@@ -942,9 +936,7 @@ async fn main() -> Result<()> {
         Commands::Providers => {
             let providers = providers::list_providers();
             let current = config
-                .default_provider
-                .as_deref()
-                .unwrap_or("openrouter")
+                .resolved_default_provider()
                 .trim()
                 .to_ascii_lowercase();
             println!("Supported providers ({} total):\n", providers.len());

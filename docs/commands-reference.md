@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`freeclaw --help`).
 
-Last verified: **February 21, 2026**.
+Last verified: **February 28, 2026**.
 
 ## Top-Level Commands
 
@@ -113,6 +113,14 @@ Notes:
 - `freeclaw models refresh`
 - `freeclaw models refresh --provider <ID>`
 - `freeclaw models refresh --force`
+- `freeclaw models list [--provider <ID>]`
+- `freeclaw models set <MODEL_REF_OR_MODEL_ID>`
+- `freeclaw models status`
+
+Notes:
+
+- `models set` accepts either `provider/model` or a raw model id.
+- `models status` shows resolved provider/model plus `models.default.primary` and fallbacks when configured.
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
@@ -154,6 +162,8 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/reset` (start a new session without archiving log)
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
+- `models.default.*`
+- `models.routes.*`
 - `default_provider`
 - `default_model`
 - `default_temperature`

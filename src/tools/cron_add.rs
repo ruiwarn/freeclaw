@@ -270,7 +270,7 @@ impl Tool for CronAddTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::config::Config;

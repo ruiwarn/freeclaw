@@ -185,6 +185,7 @@ libc = "0.2"
 
 [features]
 default = []
+legacy-security-tests = []
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]

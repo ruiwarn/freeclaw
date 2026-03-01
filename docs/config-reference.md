@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 28, 2026**.
 
 Config path resolution at startup:
 
@@ -22,9 +22,18 @@ Schema export command:
 
 | Key | Default | Notes |
 |---|---|---|
+| `models.default.primary` | unset (derived from legacy defaults on save/load) | canonical default model ref, format: `provider/model` or model id |
+| `models.default.fallbacks` | `[]` | ordered fallback model refs |
+| `models.routes.<hint>.primary` | unset | per-hint primary model ref |
+| `models.routes.<hint>.fallbacks` | `[]` | per-hint fallback model refs |
 | `default_provider` | `openrouter` | provider ID or alias |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+
+Compatibility note:
+
+- `default_provider` / `default_model` are still supported and auto-synced with `[models]`.
+- Runtime resolution uses the synced effective values, so both shapes remain backward compatible.
 
 ## `[observability]`
 
@@ -377,6 +386,22 @@ Notes:
 
 Use route hints so integrations can keep stable names while model IDs evolve.
 
+`[models]` and route compatibility:
+
+- `[models.default]` is the user-facing default model chain.
+- `[models.routes.<hint>]` is the user-facing per-hint model chain.
+- FreeClaw materializes these into legacy `[[model_routes]]` and `reliability.*` fallback structures for runtime compatibility.
+
+```toml
+[models.default]
+primary = "openai/gpt-5-mini"
+fallbacks = ["anthropic/claude-sonnet-4.6", "openai/gpt-4.1-mini"]
+
+[models.routes.coding]
+primary = "openai/gpt-5-codex"
+fallbacks = ["openrouter/anthropic/claude-sonnet-4.6"]
+```
+
 ### `[[model_routes]]`
 
 | Key | Default | Purpose |
@@ -494,7 +519,7 @@ Notes:
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
-- While `freeclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+- While `freeclaw channel start` is running, updates to `models.default.*`, `models.routes.*`, `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 ### `[channels_config.nostr]`
 

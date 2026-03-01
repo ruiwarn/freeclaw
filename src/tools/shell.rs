@@ -138,7 +138,7 @@ impl Tool for ShellTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};

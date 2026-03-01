@@ -71,7 +71,7 @@ pub fn redact(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
 

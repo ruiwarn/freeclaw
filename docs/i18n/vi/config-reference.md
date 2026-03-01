@@ -2,7 +2,7 @@
 
 Các mục cấu hình thường dùng và giá trị mặc định.
 
-Xác minh lần cuối: **2026-02-19**.
+Xác minh lần cuối: **2026-02-28**.
 
 Thứ tự tìm config khi khởi động:
 
@@ -22,9 +22,18 @@ Lệnh xuất schema:
 
 | Khóa | Mặc định | Ghi chú |
 |---|---|---|
+| `models.default.primary` | chưa đặt (được đồng bộ từ khóa cũ khi tải/lưu) | model mặc định chuẩn, định dạng: `provider/model` hoặc model id |
+| `models.default.fallbacks` | `[]` | chuỗi model fallback theo thứ tự |
+| `models.routes.<hint>.primary` | chưa đặt | model chính theo hint |
+| `models.routes.<hint>.fallbacks` | `[]` | fallback theo hint |
 | `default_provider` | `openrouter` | ID hoặc bí danh provider |
 | `default_model` | `anthropic/claude-sonnet-4-6` | Model định tuyến qua provider đã chọn |
 | `default_temperature` | `0.7` | Nhiệt độ model |
+
+Lưu ý tương thích:
+
+- `default_provider` / `default_model` vẫn được hỗ trợ và tự đồng bộ với `[models]`.
+- Runtime dùng giá trị đã đồng bộ, nên hai dạng cấu hình đều tương thích ngược.
 
 ## `[observability]`
 
@@ -304,6 +313,22 @@ Lưu ý:
 
 Route hint giúp tên tích hợp ổn định khi model ID thay đổi.
 
+`[models]` và tương thích route:
+
+- `[models.default]` là chuỗi model mặc định thân thiện cho người dùng.
+- `[models.routes.<hint>]` là chuỗi model theo từng hint.
+- FreeClaw tự materialize các mục này sang `[[model_routes]]` và `reliability.*` để giữ tương thích runtime.
+
+```toml
+[models.default]
+primary = "openai/gpt-5-mini"
+fallbacks = ["anthropic/claude-sonnet-4.6", "openai/gpt-4.1-mini"]
+
+[models.routes.coding]
+primary = "openai/gpt-5-codex"
+fallbacks = ["openrouter/anthropic/claude-sonnet-4.6"]
+```
+
 ### `[[model_routes]]`
 
 | Khóa | Mặc định | Mục đích |
@@ -407,7 +432,7 @@ Lưu ý:
 - Khi timeout xảy ra, người dùng nhận: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Hành vi ngắt chỉ Telegram được điều khiển bằng `channels_config.telegram.interrupt_on_new_message` (mặc định `false`).
   Khi bật, tin nhắn mới từ cùng người gửi trong cùng chat sẽ hủy yêu cầu đang xử lý và giữ ngữ cảnh người dùng bị ngắt.
-- Khi `freeclaw channel start` đang chạy, thay đổi `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url` và `reliability.*` được áp dụng nóng từ `config.toml` ở tin nhắn tiếp theo.
+- Khi `freeclaw channel start` đang chạy, thay đổi `models.default.*`, `models.routes.*`, `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url` và `reliability.*` được áp dụng nóng từ `config.toml` ở tin nhắn tiếp theo.
 
 Xem ma trận kênh và hành vi allowlist chi tiết tại [channels-reference.md](channels-reference.md).
 

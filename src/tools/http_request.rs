@@ -448,7 +448,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};

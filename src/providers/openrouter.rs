@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenRouterProvider {
     credential: Option<String>,
     reasoning_enabled: Option<bool>,
+    reasoning_level: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,6 +154,7 @@ impl OpenRouterProvider {
         Self {
             credential: credential.map(ToString::to_string),
             reasoning_enabled: None,
+            reasoning_level: super::DEFAULT_REASONING_LEVEL.to_string(),
         }
     }
 
@@ -161,14 +163,22 @@ impl OpenRouterProvider {
         self
     }
 
+    pub fn with_reasoning_level(mut self, reasoning_level: Option<&str>) -> Self {
+        self.reasoning_level = super::normalize_reasoning_level(reasoning_level).to_string();
+        self
+    }
+
     fn apply_reasoning_override(&self, payload: &mut serde_json::Value) {
         if self.reasoning_enabled != Some(true) {
             return;
         }
+        let Some(effort) = super::reasoning_effort_for_level(Some(&self.reasoning_level)) else {
+            return;
+        };
         if let Some(map) = payload.as_object_mut() {
             map.insert(
                 "reasoning_effort".to_string(),
-                serde_json::Value::String("high".to_string()),
+                serde_json::Value::String(effort.to_string()),
             );
         }
     }
@@ -637,8 +647,27 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_override_sets_high_effort_when_enabled() {
+    fn reasoning_override_sets_medium_effort_when_enabled() {
         let provider = OpenRouterProvider::new(None).with_reasoning(Some(true));
+        let mut payload = serde_json::json!({
+            "model": "anthropic/claude-sonnet-4",
+            "messages": [],
+            "temperature": 0.7
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&serde_json::Value::String("medium".to_string()))
+        );
+    }
+
+    #[test]
+    fn reasoning_override_respects_reasoning_level() {
+        let provider = OpenRouterProvider::new(None)
+            .with_reasoning(Some(true))
+            .with_reasoning_level(Some("high"));
         let mut payload = serde_json::json!({
             "model": "anthropic/claude-sonnet-4",
             "messages": [],

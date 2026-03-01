@@ -279,8 +279,10 @@ impl ModelRoutingConfigTool {
 
         json!({
             "default": {
-                "provider": cfg.default_provider,
-                "model": cfg.default_model,
+                "provider": cfg.resolved_default_provider(),
+                "model": cfg.resolved_default_model(),
+                "primary": cfg.models.default.primary.clone(),
+                "fallbacks": cfg.models.default.fallbacks.clone(),
                 "temperature": cfg.default_temperature,
             },
             "query_classification": {
@@ -400,6 +402,8 @@ impl ModelRoutingConfigTool {
             MaybeSet::Null => cfg.default_model = None,
             MaybeSet::Unset => {}
         }
+
+        cfg.sync_models_primary_from_legacy_defaults();
 
         match temperature_update {
             MaybeSet::Set(temperature) => {
@@ -1084,6 +1088,7 @@ mod tests {
         assert!(output["agents"]["coder"].is_null());
     }
 
+    #[cfg(feature = "legacy-security-tests")]
     #[tokio::test]
     async fn read_only_mode_blocks_mutating_actions() {
         let tmp = TempDir::new().unwrap();

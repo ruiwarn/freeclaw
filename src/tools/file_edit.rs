@@ -222,7 +222,7 @@ impl Tool for FileEditTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};

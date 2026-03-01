@@ -1,3 +1,4 @@
+use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, TokenUsage, ToolCall as ProviderToolCall,
@@ -11,6 +12,7 @@ pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
     reasoning_enabled: Option<bool>,
+    reasoning_level: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,7 +160,12 @@ struct NativeContentIn {
 }
 
 impl AnthropicProvider {
-    const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 1024;
+    const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2048;
+    const OFFICIAL_BASE_URL: &'static str = "https://api.anthropic.com";
+    const BETA_FINE_GRAINED_TOOL_STREAMING: &'static str = "fine-grained-tool-streaming-2025-05-14";
+    const BETA_INTERLEAVED_THINKING: &'static str = "interleaved-thinking-2025-05-14";
+    const BETA_CLAUDE_CODE: &'static str = "claude-code-20250219";
+    const BETA_OAUTH: &'static str = "oauth-2025-04-20";
 
     pub fn new(credential: Option<&str>) -> Self {
         Self::with_base_url(credential, None)
@@ -166,9 +173,8 @@ impl AnthropicProvider {
 
     pub fn with_base_url(credential: Option<&str>, base_url: Option<&str>) -> Self {
         let base_url = base_url
-            .map(|u| u.trim_end_matches('/'))
-            .unwrap_or("https://api.anthropic.com")
-            .to_string();
+            .map(Self::normalize_base_url)
+            .unwrap_or_else(|| Self::OFFICIAL_BASE_URL.to_string());
         Self {
             credential: credential
                 .map(str::trim)
@@ -176,6 +182,7 @@ impl AnthropicProvider {
                 .map(ToString::to_string),
             base_url,
             reasoning_enabled: None,
+            reasoning_level: super::DEFAULT_REASONING_LEVEL.to_string(),
         }
     }
 
@@ -184,17 +191,27 @@ impl AnthropicProvider {
         self
     }
 
+    pub fn with_reasoning_level(mut self, reasoning_level: Option<&str>) -> Self {
+        self.reasoning_level = super::normalize_reasoning_level(reasoning_level).to_string();
+        self
+    }
+
     fn apply_reasoning_override(&self, payload: &mut serde_json::Value) {
         if self.reasoning_enabled != Some(true) {
             return;
         }
+        let Some(budget_tokens) =
+            super::anthropic_thinking_budget_for_level(Some(&self.reasoning_level))
+        else {
+            return;
+        };
 
         if let Some(map) = payload.as_object_mut() {
             map.insert(
                 "thinking".to_string(),
                 serde_json::json!({
                     "type": "enabled",
-                    "budget_tokens": Self::DEFAULT_THINKING_BUDGET_TOKENS
+                    "budget_tokens": budget_tokens
                 }),
             );
         }
@@ -204,18 +221,67 @@ impl AnthropicProvider {
         token.starts_with("sk-ant-oat01-")
     }
 
+    /// Normalize base URL so callers can pass either host root or `/v1`.
+    fn normalize_base_url(url: &str) -> String {
+        url.trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string()
+    }
+
+    fn is_custom_base_url(&self) -> bool {
+        self.base_url != Self::OFFICIAL_BASE_URL
+    }
+
+    fn auth_kind_for_credential(&self, credential: &str) -> AnthropicAuthKind {
+        if Self::is_setup_token(credential) {
+            return AnthropicAuthKind::Authorization;
+        }
+        detect_auth_kind(credential, None)
+    }
+
+    fn anthropic_beta_values(&self, credential: &str) -> Vec<&'static str> {
+        let mut betas: Vec<&'static str> = Vec::new();
+
+        // OpenClaw/Claude-Code compatible custom endpoints generally expect these
+        // feature headers in Anthropic-messages mode.
+        if self.is_custom_base_url() || Self::is_setup_token(credential) {
+            betas.push(Self::BETA_FINE_GRAINED_TOOL_STREAMING);
+            betas.push(Self::BETA_INTERLEAVED_THINKING);
+        }
+
+        if Self::is_setup_token(credential) {
+            betas.push(Self::BETA_CLAUDE_CODE);
+            betas.push(Self::BETA_OAUTH);
+        }
+
+        betas
+    }
+
     fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
         credential: &str,
     ) -> reqwest::RequestBuilder {
-        if Self::is_setup_token(credential) {
-            request
-                .header("Authorization", format!("Bearer {credential}"))
-                .header("anthropic-beta", "oauth-2025-04-20")
-        } else {
-            request.header("x-api-key", credential)
+        let auth_kind = self.auth_kind_for_credential(credential);
+        let mut req = match auth_kind {
+            AnthropicAuthKind::Authorization => {
+                // Some Anthropic-compatible proxies validate auth on either header.
+                // Keep bearer as canonical while mirroring x-api-key on custom endpoints.
+                let req = request.header("Authorization", format!("Bearer {credential}"));
+                if self.is_custom_base_url() {
+                    req.header("x-api-key", credential)
+                } else {
+                    req
+                }
+            }
+            AnthropicAuthKind::ApiKey => request.header("x-api-key", credential),
+        };
+
+        let betas = self.anthropic_beta_values(credential);
+        if !betas.is_empty() {
+            req = req.header("anthropic-beta", betas.join(","));
         }
+        req
     }
 
     /// Cache system prompts larger than ~1024 tokens (3KB of text)
@@ -657,6 +723,12 @@ mod tests {
     }
 
     #[test]
+    fn custom_base_url_trims_trailing_v1_segment() {
+        let p = AnthropicProvider::with_base_url(None, Some("https://api.example.com/v1/"));
+        assert_eq!(p.base_url, "https://api.example.com");
+    }
+
+    #[test]
     fn default_base_url_when_none_provided() {
         let p = AnthropicProvider::with_base_url(None, None);
         assert_eq!(p.base_url, "https://api.anthropic.com");
@@ -677,6 +749,27 @@ mod tests {
             Some(&serde_json::json!({
                 "type": "enabled",
                 "budget_tokens": AnthropicProvider::DEFAULT_THINKING_BUDGET_TOKENS
+            }))
+        );
+    }
+
+    #[test]
+    fn reasoning_override_respects_reasoning_level() {
+        let provider = AnthropicProvider::new(None)
+            .with_reasoning(Some(true))
+            .with_reasoning_level(Some("high"));
+        let mut payload = serde_json::json!({
+            "model": "claude-opus-4-6",
+            "max_tokens": 4096
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert_eq!(
+            payload.get("thinking"),
+            Some(&serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 4096
             }))
         );
     }
@@ -739,7 +832,9 @@ mod tests {
                 .headers()
                 .get("anthropic-beta")
                 .and_then(|v| v.to_str().ok()),
-            Some("oauth-2025-04-20")
+            Some(
+                "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14,claude-code-20250219,oauth-2025-04-20"
+            )
         );
         assert!(request.headers().get("x-api-key").is_none());
     }
@@ -766,6 +861,72 @@ mod tests {
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[test]
+    fn apply_auth_adds_default_betas_for_custom_endpoint_api_key() {
+        let provider = AnthropicProvider::with_base_url(None, Some("https://proxy.example.com"));
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://proxy.example.com/v1/messages"),
+                "sk-ant-api-key",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("sk-ant-api-key")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some("fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14")
+        );
+        assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn apply_auth_uses_bearer_and_keeps_x_api_key_on_custom_endpoint_for_jwt_tokens() {
+        let provider = AnthropicProvider::with_base_url(None, Some("https://proxy.example.com"));
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://proxy.example.com/v1/messages"),
+                "header.payload.signature",
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer header.payload.signature")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("header.payload.signature")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some("fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14")
+        );
     }
 
     #[tokio::test]
@@ -1309,6 +1470,7 @@ mod tests {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             reasoning_enabled: None,
+            reasoning_level: crate::providers::DEFAULT_REASONING_LEVEL.to_string(),
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

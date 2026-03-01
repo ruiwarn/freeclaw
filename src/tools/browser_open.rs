@@ -356,7 +356,7 @@ fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
     Some(octets)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};

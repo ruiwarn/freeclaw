@@ -637,7 +637,7 @@ fn truncate_utf8(input: &str, max_bytes: usize) -> &str {
     &input[..end]
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};

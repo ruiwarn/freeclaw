@@ -74,6 +74,7 @@ const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+pub const DEFAULT_REASONING_LEVEL: &str = "medium";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -171,6 +172,47 @@ pub(crate) fn is_qianfan_alias(name: &str) -> bool {
 
 pub(crate) fn is_doubao_alias(name: &str) -> bool {
     matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
+}
+
+pub(crate) fn normalize_reasoning_level(level: Option<&str>) -> &'static str {
+    match level
+        .map(str::trim)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" => "off",
+        "minimal" => "minimal",
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        _ => DEFAULT_REASONING_LEVEL,
+    }
+}
+
+pub(crate) fn reasoning_effort_for_level(level: Option<&str>) -> Option<&'static str> {
+    match normalize_reasoning_level(level) {
+        "off" => None,
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        _ => Some(DEFAULT_REASONING_LEVEL),
+    }
+}
+
+pub(crate) fn anthropic_thinking_budget_for_level(level: Option<&str>) -> Option<u32> {
+    match normalize_reasoning_level(level) {
+        "off" => None,
+        "minimal" => Some(512),
+        "low" => Some(1024),
+        "medium" => Some(2048),
+        "high" => Some(4096),
+        "xhigh" => Some(8192),
+        _ => Some(2048),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -676,6 +718,7 @@ pub struct ProviderRuntimeOptions {
     pub freeclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    pub reasoning_level: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -686,6 +729,7 @@ impl Default for ProviderRuntimeOptions {
             freeclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: Some(true),
+            reasoning_level: Some(DEFAULT_REASONING_LEVEL.to_string()),
         }
     }
 }
@@ -969,14 +1013,14 @@ fn create_provider_with_url_and_options(
         }
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(
-            openrouter::OpenRouterProvider::new(key).with_reasoning(options.reasoning_enabled),
+            openrouter::OpenRouterProvider::new(key).with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "anthropic" => Ok(Box::new(
-            anthropic::AnthropicProvider::new(key).with_reasoning(options.reasoning_enabled),
+            anthropic::AnthropicProvider::new(key).with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "openai" => Ok(Box::new(
             openai::OpenAiProvider::with_base_url(api_url, key)
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
@@ -1006,7 +1050,7 @@ fn create_provider_with_url_and_options(
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(
             OpenAiCompatibleProvider::new("Venice", "https://api.venice.ai", key, AuthStyle::Bearer)
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "vercel" | "vercel-ai" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1015,7 +1059,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "cloudflare" | "cloudflare-ai" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1024,7 +1068,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         name if moonshot_base_url(name).is_some() => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1033,7 +1077,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
             OpenAiCompatibleProvider::new_with_user_agent(
@@ -1043,7 +1087,7 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
                 "KimiCLI/0.77",
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "synthetic" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1052,7 +1096,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "opencode" | "opencode-zen" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1061,7 +1105,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         name if zai_base_url(name).is_some() => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1070,7 +1114,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         name if glm_base_url(name).is_some() => {
             Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
@@ -1079,7 +1123,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled)))
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref())))
         }
         name if minimax_base_url(name).is_some() => Ok(Box::new(
             OpenAiCompatibleProvider::new_merge_system_into_user(
@@ -1088,7 +1132,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
         name if is_qwen_oauth_alias(name) => {
@@ -1108,7 +1152,7 @@ fn create_provider_with_url_and_options(
                 "QwenCode/1.0",
                 true,
             )
-            .with_reasoning(options.reasoning_enabled)))
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref())))
         }
         name if is_qianfan_alias(name) => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1117,7 +1161,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         name if is_doubao_alias(name) => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1126,7 +1170,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         name if qwen_base_url(name).is_some() => Ok(Box::new(
             OpenAiCompatibleProvider::new_with_vision(
@@ -1136,25 +1180,25 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
                 true,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(
             OpenAiCompatibleProvider::new("Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer)
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "mistral" => Ok(Box::new(
             OpenAiCompatibleProvider::new("Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer)
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "xai" | "grok" => Ok(Box::new(
             OpenAiCompatibleProvider::new("xAI", "https://api.x.ai", key, AuthStyle::Bearer)
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "deepseek" => Ok(Box::new(
             OpenAiCompatibleProvider::new("DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer)
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "together" | "together-ai" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1163,7 +1207,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "fireworks" | "fireworks-ai" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1172,7 +1216,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "novita" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1181,7 +1225,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "perplexity" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1190,7 +1234,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "cohere" => Ok(Box::new(
             OpenAiCompatibleProvider::new(
@@ -1199,7 +1243,7 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "lmstudio" | "lm-studio" => {
@@ -1214,7 +1258,7 @@ fn create_provider_with_url_and_options(
                     Some(lm_studio_key),
                     AuthStyle::Bearer,
                 )
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
             ))
         }
         "llamacpp" | "llama.cpp" => {
@@ -1233,7 +1277,7 @@ fn create_provider_with_url_and_options(
                     Some(llama_cpp_key),
                     AuthStyle::Bearer,
                 )
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
             ))
         }
         "sglang" => {
@@ -1243,7 +1287,7 @@ fn create_provider_with_url_and_options(
                 .unwrap_or("http://localhost:30000/v1");
             Ok(Box::new(
                 OpenAiCompatibleProvider::new("SGLang", base_url, key, AuthStyle::Bearer)
-                    .with_reasoning(options.reasoning_enabled),
+                    .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
             ))
         }
         "vllm" => {
@@ -1253,7 +1297,7 @@ fn create_provider_with_url_and_options(
                 .unwrap_or("http://localhost:8000/v1");
             Ok(Box::new(
                 OpenAiCompatibleProvider::new("vLLM", base_url, key, AuthStyle::Bearer)
-                    .with_reasoning(options.reasoning_enabled),
+                    .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
             ))
         }
         "osaurus" => {
@@ -1272,7 +1316,7 @@ fn create_provider_with_url_and_options(
                     Some(osaurus_key),
                     AuthStyle::Bearer,
                 )
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
             ))
         }
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(Box::new(
@@ -1282,20 +1326,20 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
             )
-            .with_reasoning(options.reasoning_enabled),
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
 
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(Box::new(
             OpenAiCompatibleProvider::new("Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer)
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
         )),
 
         // ── Cloud AI endpoints ───────────────────────────────
         "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
             Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
             key,
-        ).with_reasoning(options.reasoning_enabled))),
+        ).with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
         // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
@@ -1313,7 +1357,7 @@ fn create_provider_with_url_and_options(
                     AuthStyle::Bearer,
                     true,
                 )
-                .with_reasoning(options.reasoning_enabled),
+                .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref()),
             ))
         }
 
@@ -1329,7 +1373,7 @@ fn create_provider_with_url_and_options(
                 key,
                 Some(&base_url),
             )
-            .with_reasoning(options.reasoning_enabled)))
+            .with_reasoning(options.reasoning_enabled).with_reasoning_level(options.reasoning_level.as_deref())))
         }
 
         _ => anyhow::bail!(
@@ -1381,12 +1425,19 @@ pub fn create_resilient_provider_with_options(
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    let profile_key_for = |provider_name: &str| {
+        reliability
+            .provider_api_keys
+            .get(provider_name)
+            .map(String::as_str)
+    };
+    let primary_key = api_key.or_else(|| profile_key_for(primary_name));
 
     let primary_provider = match primary_name {
         "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
+            create_provider_with_options(primary_name, primary_key, options)?
         }
-        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
+        _ => create_provider_with_url_and_options(primary_name, primary_key, api_url, options)?,
     };
     providers.push((primary_name.to_string(), primary_provider));
 
@@ -1415,7 +1466,8 @@ pub fn create_resilient_provider_with_options(
             None => options.clone(),
         };
 
-        match create_provider_with_options(provider_name, None, &fallback_options) {
+        let fallback_key = profile_key_for(provider_name);
+        match create_provider_with_options(provider_name, fallback_key, &fallback_options) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -1432,7 +1484,8 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_model_provider_fallbacks(reliability.model_provider_fallbacks.clone());
 
     Ok(Box::new(reliable))
 }
@@ -1489,6 +1542,12 @@ pub fn create_routed_provider_with_options(
 
     // Create each provider (with its own resilience wrapper)
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    let profile_key_for = |provider_name: &str| {
+        reliability
+            .provider_api_keys
+            .get(provider_name)
+            .map(String::as_str)
+    };
     for name in &needed {
         let routed_credential = model_routes
             .iter()
@@ -1499,7 +1558,9 @@ pub fn create_routed_provider_with_options(
                     (!trimmed_key.is_empty()).then_some(trimmed_key)
                 })
             });
-        let key = routed_credential.or(api_key);
+        let key = routed_credential
+            .or_else(|| profile_key_for(name))
+            .or(api_key);
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
         match create_resilient_provider_with_options(name, key, url, reliability, options) {
@@ -2542,7 +2603,9 @@ mod tests {
                 "openai".into(),
             ],
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -2570,6 +2633,34 @@ mod tests {
         assert!(provider.is_err());
     }
 
+    #[test]
+    fn resilient_primary_uses_provider_api_key_map_when_global_key_missing() {
+        let _guard = env_lock();
+        let _openai = EnvGuard::set("OPENAI_API_KEY", None);
+        let _freeclaw = EnvGuard::set("FREECLAW_API_KEY", None);
+        let _generic = EnvGuard::set("API_KEY", None);
+
+        let reliability = crate::config::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: Vec::new(),
+            api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::from([(
+                "openai".to_string(),
+                "provider-profile-key".to_string(),
+            )]),
+            model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider("openai", None, None, &reliability);
+        assert!(provider.is_ok());
+    }
+
     /// Fallback providers resolve their own credentials via provider-specific
     /// env vars rather than inheriting the primary provider's key.  A provider
     /// that requires no key (e.g. lmstudio, ollama) must initialize
@@ -2581,7 +2672,9 @@ mod tests {
             provider_backoff_ms: 100,
             fallback_providers: vec!["lmstudio".into(), "ollama".into()],
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -2603,7 +2696,9 @@ mod tests {
             provider_backoff_ms: 100,
             fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -2629,7 +2724,9 @@ mod tests {
                 "lmstudio".into(),
             ],
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -2661,7 +2758,9 @@ mod tests {
             provider_backoff_ms: 100,
             fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -2954,7 +3053,9 @@ mod tests {
             provider_backoff_ms: 100,
             fallback_providers: vec!["openai-codex:second".into()],
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
@@ -2983,7 +3084,9 @@ mod tests {
                 "nonexistent-provider".into(),
             ],
             api_keys: Vec::new(),
+            provider_api_keys: std::collections::HashMap::new(),
             model_fallbacks: std::collections::HashMap::new(),
+            model_provider_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,

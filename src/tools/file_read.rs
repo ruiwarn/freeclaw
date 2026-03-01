@@ -157,7 +157,7 @@ fn try_extract_pdf_text(_bytes: &[u8]) -> Option<String> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};

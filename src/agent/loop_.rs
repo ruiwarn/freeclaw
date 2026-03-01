@@ -2837,13 +2837,11 @@ pub async fn run(
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
-        .or(config.default_provider.as_deref())
-        .unwrap_or("openrouter");
+        .unwrap_or(config.resolved_default_provider());
 
     let model_name = model_override
         .as_deref()
-        .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .unwrap_or(config.resolved_default_model());
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -2851,6 +2849,7 @@ pub async fn run(
         freeclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_level: Some(config.runtime.reasoning_level.clone()),
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -3291,17 +3290,15 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
 
-    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model_name = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider_name = config.resolved_default_provider();
+    let model_name = config.resolved_default_model().to_string();
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
         freeclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_level: Some(config.runtime.reasoning_level.clone()),
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,

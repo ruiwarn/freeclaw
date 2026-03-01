@@ -2,7 +2,7 @@
 
 Dựa trên CLI hiện tại (`freeclaw --help`).
 
-Xác minh lần cuối: **2026-02-20**.
+Xác minh lần cuối: **2026-02-28**.
 
 ## Lệnh cấp cao nhất
 
@@ -74,6 +74,14 @@ Xác minh lần cuối: **2026-02-20**.
 - `freeclaw models refresh`
 - `freeclaw models refresh --provider <ID>`
 - `freeclaw models refresh --force`
+- `freeclaw models list [--provider <ID>]`
+- `freeclaw models set <MODEL_REF_HOẶC_MODEL_ID>`
+- `freeclaw models status`
+
+Lưu ý:
+
+- `models set` chấp nhận `provider/model` hoặc model id thuần.
+- `models status` hiển thị provider/model đã resolve, cùng `models.default.primary` và fallbacks khi có cấu hình.
 
 `models refresh` hiện hỗ trợ làm mới danh mục trực tiếp cho các provider: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen` và `nvidia`.
 
@@ -106,6 +114,8 @@ Lệnh trong chat khi runtime đang chạy (Telegram/Discord):
 - `/reset` (bắt đầu phiên mới mà không lưu log)
 
 Channel runtime cũng theo dõi `config.toml` và tự động áp dụng thay đổi cho:
+- `models.default.*`
+- `models.routes.*`
 - `default_provider`
 - `default_model`
 - `default_temperature`

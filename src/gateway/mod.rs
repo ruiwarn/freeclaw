@@ -339,7 +339,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let display_addr = format!("{host}:{actual_port}");
 
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        config.resolved_default_provider(),
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
@@ -349,12 +349,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             freeclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
+            reasoning_level: Some(config.runtime.reasoning_level.clone()),
         },
     )?);
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    let model = config.resolved_default_model().to_string();
     let temperature = config.default_temperature.unwrap_or(f64::NAN);
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
@@ -963,12 +961,7 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+    let provider_label = state.config.lock().resolved_default_provider().to_string();
     let model_label = state.model.clone();
     let started_at = Instant::now();
 

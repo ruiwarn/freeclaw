@@ -39,6 +39,7 @@ pub struct OpenAiCompatibleProvider {
     native_tool_calling: bool,
     /// Global runtime override for provider-side reasoning/thinking behavior.
     reasoning_enabled: Option<bool>,
+    reasoning_level: String,
 }
 
 /// How the provider expects the API key to be sent.
@@ -173,11 +174,17 @@ impl OpenAiCompatibleProvider {
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
             reasoning_enabled: None,
+            reasoning_level: super::DEFAULT_REASONING_LEVEL.to_string(),
         }
     }
 
     pub fn with_reasoning(mut self, reasoning_enabled: Option<bool>) -> Self {
         self.reasoning_enabled = reasoning_enabled;
+        self
+    }
+
+    pub fn with_reasoning_level(mut self, reasoning_level: Option<&str>) -> Self {
+        self.reasoning_level = super::normalize_reasoning_level(reasoning_level).to_string();
         self
     }
 
@@ -209,9 +216,13 @@ impl OpenAiCompatibleProvider {
 
         // For generic OpenAI-compatible endpoints, only inject on explicit enable.
         if enabled {
+            let Some(effort) = super::reasoning_effort_for_level(Some(&self.reasoning_level))
+            else {
+                return;
+            };
             map.insert(
                 "reasoning_effort".to_string(),
-                serde_json::Value::String("high".to_string()),
+                serde_json::Value::String(effort.to_string()),
             );
         }
     }
@@ -1829,9 +1840,28 @@ mod tests {
 
         assert_eq!(
             payload.get("reasoning_effort"),
-            Some(&serde_json::Value::String("high".to_string()))
+            Some(&serde_json::Value::String("medium".to_string()))
         );
         assert!(payload.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn reasoning_override_respects_reasoning_level_for_generic_compatible_endpoints() {
+        let provider = make_provider("Venice", "https://api.venice.ai", Some("k"))
+            .with_reasoning(Some(true))
+            .with_reasoning_level(Some("high"));
+        let mut payload = serde_json::json!({
+            "model": "venice-large",
+            "messages": [],
+            "temperature": 0.7
+        });
+
+        provider.apply_reasoning_override(&mut payload);
+
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&serde_json::Value::String("high".to_string()))
+        );
     }
 
     #[test]

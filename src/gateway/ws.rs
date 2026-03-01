@@ -79,12 +79,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
 
         // Process message with the LLM provider
-        let provider_label = state
-            .config
-            .lock()
-            .default_provider
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        let provider_label = state.config.lock().resolved_default_provider().to_string();
 
         // Broadcast agent_start event
         let _ = state.event_tx.send(serde_json::json!({

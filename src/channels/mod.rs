@@ -42,7 +42,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
+pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -71,15 +71,16 @@ use crate::agent::loop_::{
     build_tool_instructions, pending_approval_request_from_error, run_tool_call_loop,
     scrub_credentials,
 };
+use crate::config::schema::ModelProviderConfig;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
+use crate::priority_prompt::ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
-use crate::priority_prompt::ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -117,7 +118,6 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
-const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
@@ -150,12 +150,15 @@ struct ChannelRouteSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelRuntimeCommand {
+    ShowModelsOverview,
+    ShowModelsCurrent,
+    ShowModelsFallback,
     ShowProviders,
     SetProvider(String),
-    ShowModel,
     ShowStatus,
     SetModelByIndex(usize),
     SetModel(String),
+    SaveModelAsDefault,
     ShowMemoryHelp,
     PrepareMemoryClean(MemoryCleanupScope),
     ConfirmMemoryClean(MemoryCleanupScope),
@@ -640,7 +643,7 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord")
+    !channel_name.trim().is_empty()
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -664,23 +667,32 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     match base_command.as_str() {
         "/status" => Some(ChannelRuntimeCommand::ShowStatus),
         "/models" => {
-            let provider = parts.collect::<Vec<_>>().join(" ").trim().to_string();
-            if provider.is_empty() || provider.eq_ignore_ascii_case("list") {
+            let arg = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+            if arg.is_empty() || arg.eq_ignore_ascii_case("list") {
+                Some(ChannelRuntimeCommand::ShowModelsOverview)
+            } else if arg.eq_ignore_ascii_case("current") || arg.eq_ignore_ascii_case("status") {
+                Some(ChannelRuntimeCommand::ShowModelsCurrent)
+            } else if arg.eq_ignore_ascii_case("fallback") || arg.eq_ignore_ascii_case("fallbacks")
+            {
+                Some(ChannelRuntimeCommand::ShowModelsFallback)
+            } else if arg.eq_ignore_ascii_case("providers") || arg.eq_ignore_ascii_case("provider")
+            {
                 Some(ChannelRuntimeCommand::ShowProviders)
-            } else if provider.eq_ignore_ascii_case("status") {
-                Some(ChannelRuntimeCommand::ShowStatus)
             } else {
-                Some(ChannelRuntimeCommand::SetProvider(provider))
+                Some(ChannelRuntimeCommand::SetProvider(arg))
             }
         }
         "/model" => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
-                Some(ChannelRuntimeCommand::ShowModel)
+                Some(ChannelRuntimeCommand::ShowModelsOverview)
             } else if model.eq_ignore_ascii_case("list") {
-                Some(ChannelRuntimeCommand::ShowModel)
-            } else if model.eq_ignore_ascii_case("status") {
-                Some(ChannelRuntimeCommand::ShowStatus)
+                Some(ChannelRuntimeCommand::ShowModelsOverview)
+            } else if model.eq_ignore_ascii_case("status") || model.eq_ignore_ascii_case("current")
+            {
+                Some(ChannelRuntimeCommand::ShowModelsCurrent)
+            } else if model.eq_ignore_ascii_case("save") {
+                Some(ChannelRuntimeCommand::SaveModelAsDefault)
             } else if let Ok(index) = model.trim_matches('`').parse::<usize>() {
                 Some(ChannelRuntimeCommand::SetModelByIndex(index))
             } else {
@@ -753,18 +765,88 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
     None
 }
 
+fn resolve_provider_from_profile_alias(config: &Config, name: &str) -> Option<String> {
+    let needle = name.trim();
+    if needle.is_empty() {
+        return None;
+    }
+
+    let mut profile_keys = config.model_providers.keys().cloned().collect::<Vec<_>>();
+    profile_keys.sort();
+    for profile_key in profile_keys {
+        let Some(profile) = config.model_providers.get(&profile_key) else {
+            continue;
+        };
+
+        let profile_name = profile
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let matched_key = profile_key.eq_ignore_ascii_case(needle);
+        let matched_name = profile_name.is_some_and(|value| value.eq_ignore_ascii_case(needle));
+        if !matched_key && !matched_name {
+            continue;
+        }
+
+        let resolved_provider =
+            resolved_runtime_provider_for_profile_display(&profile_key, profile);
+        if !resolved_provider.trim().is_empty() {
+            return Some(resolved_provider);
+        }
+    }
+
+    None
+}
+
+async fn resolve_provider_alias_for_runtime_command(
+    ctx: &ChannelRuntimeContext,
+    name: &str,
+) -> Option<String> {
+    if let Some(provider) = resolve_provider_alias(name) {
+        return Some(provider);
+    }
+
+    let config = load_runtime_config_for_model_commands(ctx).await.ok()?;
+    resolve_provider_from_profile_alias(&config, name)
+}
+
+async fn resolve_provider_for_model_selection(
+    ctx: &ChannelRuntimeContext,
+    config: Option<&Config>,
+    provider: &str,
+) -> String {
+    let trimmed = provider.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some(resolved) = resolve_provider_alias(trimmed) {
+        return resolved;
+    }
+
+    if let Some(cfg) = config {
+        if let Some(resolved) = resolve_provider_from_profile_alias(cfg, trimmed) {
+            return resolved;
+        }
+        return trimmed.to_string();
+    }
+
+    if let Ok(cfg) = load_runtime_config_for_model_commands(ctx).await {
+        if let Some(resolved) = resolve_provider_from_profile_alias(&cfg, trimmed) {
+            return resolved;
+        }
+    }
+
+    trimmed.to_string()
+}
+
 fn resolved_default_provider(config: &Config) -> String {
-    config
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "openrouter".to_string())
+    config.resolved_default_provider().to_string()
 }
 
 fn resolved_default_model(config: &Config) -> String {
-    config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+    config.resolved_default_model().to_string()
 }
 
 fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
@@ -832,20 +914,35 @@ fn decrypt_optional_secret_for_runtime_reload(
 }
 
 async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
+    let parsed = load_runtime_config_from_file(path).await?;
+    Ok(runtime_defaults_from_config(&parsed))
+}
+
+async fn load_runtime_config_from_file(path: &Path) -> Result<Config> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
     let mut parsed: Config =
         toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
+    if let Some(freeclaw_dir) = path.parent() {
+        parsed.workspace_dir = freeclaw_dir.join("workspace");
+    }
 
     if let Some(freeclaw_dir) = path.parent() {
         let store = crate::security::SecretStore::new(freeclaw_dir, parsed.secrets.encrypt);
         decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
+        for provider in parsed.model_providers.values_mut() {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut provider.api_key,
+                "config.model_providers.*.api_key",
+            )?;
+        }
     }
 
     parsed.apply_env_overrides();
-    Ok(runtime_defaults_from_config(&parsed))
+    Ok(parsed)
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -1074,11 +1171,417 @@ fn load_cached_models(workspace_dir: &Path, provider_name: &str) -> Vec<String> 
         .unwrap_or_default()
 }
 
-fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
-    load_cached_models(workspace_dir, provider_name)
-        .into_iter()
-        .take(MODEL_CACHE_PREVIEW_LIMIT)
-        .collect::<Vec<_>>()
+#[derive(Debug, Clone)]
+struct ConfiguredModelEntry {
+    model_ref: String,
+    display_model_ref: String,
+    provider: String,
+    model: String,
+    source: String,
+    has_credentials: bool,
+}
+
+fn resolved_runtime_provider_for_profile_display(
+    profile_key: &str,
+    profile: &ModelProviderConfig,
+) -> String {
+    let key = profile_key.trim();
+    if key.is_empty() {
+        return String::new();
+    }
+
+    let profile_name = profile
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(key);
+    let base_url = profile
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(base_url) = base_url {
+        let lower_name = profile_name.to_ascii_lowercase();
+        if lower_name == "anthropic" || lower_name.contains("anthropic") {
+            return format!("anthropic-custom:{base_url}");
+        }
+        return format!("custom:{base_url}");
+    }
+
+    if profile_name.eq_ignore_ascii_case(key) {
+        key.to_string()
+    } else {
+        profile_name.to_string()
+    }
+}
+
+fn build_provider_display_alias_map(config: &Config) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let mut profile_keys = config.model_providers.keys().cloned().collect::<Vec<_>>();
+    profile_keys.sort();
+
+    for profile_key in profile_keys {
+        let Some(profile) = config.model_providers.get(&profile_key) else {
+            continue;
+        };
+
+        let runtime_provider = resolved_runtime_provider_for_profile_display(&profile_key, profile);
+        let runtime_provider = runtime_provider.trim();
+        if runtime_provider.is_empty() {
+            continue;
+        }
+
+        aliases
+            .entry(runtime_provider.to_string())
+            .or_insert(profile_key);
+    }
+
+    aliases
+}
+
+fn compact_provider_for_display(provider: &str) -> String {
+    let trimmed = provider.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    for prefix in ["anthropic-custom:", "custom:"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let compact = rest
+                .trim()
+                .strip_prefix("https://")
+                .or_else(|| rest.trim().strip_prefix("http://"))
+                .unwrap_or(rest.trim());
+            return format!("{prefix}{compact}");
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn provider_display_name(
+    provider: &str,
+    provider_display_aliases: &HashMap<String, String>,
+) -> String {
+    let trimmed = provider.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some(alias) = provider_display_aliases.get(trimmed) {
+        return alias.clone();
+    }
+
+    if let Some((_, alias)) = provider_display_aliases
+        .iter()
+        .find(|(resolved_provider, _)| resolved_provider.eq_ignore_ascii_case(trimmed))
+    {
+        return alias.clone();
+    }
+
+    compact_provider_for_display(trimmed)
+}
+
+fn parse_model_ref_for_channel(raw: &str, fallback_provider: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let uses_url_provider =
+        trimmed.contains("://") && (trimmed.starts_with("custom:") || trimmed.contains("-custom:"));
+    if uses_url_provider {
+        if let Some((provider, model)) = trimmed.rsplit_once('/') {
+            let provider = provider.trim();
+            let model = model.trim();
+            if provider.is_empty() || model.is_empty() {
+                return None;
+            }
+            return Some((provider.to_string(), model.to_string()));
+        }
+    }
+
+    if let Some((provider, model)) = trimmed.split_once('/') {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() {
+            return None;
+        }
+        return Some((provider.to_string(), model.to_string()));
+    }
+
+    let fallback_provider = fallback_provider.trim();
+    if fallback_provider.is_empty() {
+        return None;
+    }
+    Some((fallback_provider.to_string(), trimmed.to_string()))
+}
+
+fn provider_has_credentials(config: &Config, provider: &str) -> bool {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return false;
+    }
+
+    if config
+        .reliability
+        .provider_api_keys
+        .get(provider)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+
+    if config.model_routes.iter().any(|route| {
+        route.provider.trim() == provider
+            && route
+                .api_key
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }) {
+        return true;
+    }
+
+    config
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|default_provider| {
+            default_provider == provider
+                && config
+                    .api_key
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
+fn push_configured_model_entry(
+    entries: &mut Vec<ConfiguredModelEntry>,
+    seen: &mut HashSet<String>,
+    provider_display_aliases: &HashMap<String, String>,
+    provider: String,
+    model: String,
+    source: String,
+    has_credentials: bool,
+) {
+    if provider.trim().is_empty() || model.trim().is_empty() {
+        return;
+    }
+    let model_ref = format!("{}/{}", provider.trim(), model.trim());
+    if seen.insert(model_ref.clone()) {
+        let display_provider = provider_display_name(&provider, provider_display_aliases);
+        let display_model_ref = format!("{}/{}", display_provider, model.trim());
+        entries.push(ConfiguredModelEntry {
+            model_ref,
+            display_model_ref,
+            provider,
+            model,
+            source,
+            has_credentials,
+        });
+    }
+}
+
+fn build_configured_model_entries(
+    config: &Config,
+    current: &ChannelRouteSelection,
+) -> Vec<ConfiguredModelEntry> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let provider_display_aliases = build_provider_display_alias_map(config);
+    let default_provider = config.resolved_default_provider().to_string();
+
+    push_configured_model_entry(
+        &mut entries,
+        &mut seen,
+        &provider_display_aliases,
+        current.provider.clone(),
+        current.model.clone(),
+        "session.current".to_string(),
+        provider_has_credentials(config, &current.provider),
+    );
+
+    if let Some(primary) = config.models.default.primary.as_deref() {
+        if let Some((provider, model)) = parse_model_ref_for_channel(primary, &default_provider) {
+            push_configured_model_entry(
+                &mut entries,
+                &mut seen,
+                &provider_display_aliases,
+                provider.clone(),
+                model,
+                "default.primary".to_string(),
+                provider_has_credentials(config, &provider),
+            );
+        }
+    } else if let Some((provider, model)) =
+        parse_model_ref_for_channel(config.resolved_default_model(), &default_provider)
+    {
+        push_configured_model_entry(
+            &mut entries,
+            &mut seen,
+            &provider_display_aliases,
+            provider.clone(),
+            model,
+            "default.legacy".to_string(),
+            provider_has_credentials(config, &provider),
+        );
+    }
+
+    for (idx, fallback) in config.models.default.fallbacks.iter().enumerate() {
+        if let Some((provider, model)) = parse_model_ref_for_channel(fallback, &default_provider) {
+            push_configured_model_entry(
+                &mut entries,
+                &mut seen,
+                &provider_display_aliases,
+                provider.clone(),
+                model,
+                format!("default.fallback.{}", idx + 1),
+                provider_has_credentials(config, &provider),
+            );
+        }
+    }
+
+    let mut route_hints = config.models.routes.keys().cloned().collect::<Vec<_>>();
+    route_hints.sort();
+    for hint in route_hints {
+        if let Some(selection) = config.models.routes.get(&hint) {
+            if let Some(primary) = selection.primary.as_deref() {
+                if let Some((provider, model)) =
+                    parse_model_ref_for_channel(primary, &default_provider)
+                {
+                    push_configured_model_entry(
+                        &mut entries,
+                        &mut seen,
+                        &provider_display_aliases,
+                        provider.clone(),
+                        model,
+                        format!("models.routes.{hint}"),
+                        provider_has_credentials(config, &provider),
+                    );
+                }
+            }
+        }
+    }
+
+    for route in &config.model_routes {
+        push_configured_model_entry(
+            &mut entries,
+            &mut seen,
+            &provider_display_aliases,
+            route.provider.clone(),
+            route.model.clone(),
+            format!("model_routes.{}", route.hint),
+            provider_has_credentials(config, &route.provider)
+                || route
+                    .api_key
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+        );
+    }
+
+    entries
+}
+
+async fn load_runtime_config_for_model_commands(ctx: &ChannelRuntimeContext) -> Result<Config> {
+    let Some(path) = runtime_config_path(ctx) else {
+        let defaults = runtime_defaults_snapshot(ctx);
+        let mut synthesized = Config::default();
+        synthesized.default_provider = Some(defaults.default_provider.clone());
+        synthesized.default_model = Some(defaults.model.clone());
+        synthesized.sync_models_primary_from_legacy_defaults();
+        synthesized.default_temperature = Some(defaults.temperature);
+        synthesized.api_key = defaults.api_key;
+        synthesized.api_url = defaults.api_url;
+        synthesized.reliability = defaults.reliability;
+        return Ok(synthesized);
+    };
+
+    load_runtime_config_from_file(&path).await
+}
+
+fn build_models_overview_response(
+    current: &ChannelRouteSelection,
+    defaults: &ChannelRuntimeDefaults,
+    entries: &[ConfiguredModelEntry],
+) -> String {
+    let mut response = String::new();
+    let _ = writeln!(
+        response,
+        "Current session: provider=`{}`, model=`{}`",
+        current.provider, current.model
+    );
+    let _ = writeln!(
+        response,
+        "Workspace default: provider=`{}`, model=`{}`",
+        defaults.default_provider, defaults.model
+    );
+
+    if entries.is_empty() {
+        response.push_str("\nNo configured model entries found.\n");
+    } else {
+        response.push_str("\nConfigured model pool:\n");
+        for (idx, entry) in entries.iter().enumerate() {
+            let marker = if entry.provider == current.provider && entry.model == current.model {
+                "*"
+            } else {
+                " "
+            };
+            let credential = if entry.has_credentials {
+                "ready"
+            } else {
+                "missing"
+            };
+            let _ = writeln!(
+                response,
+                "{}. {} `{}`  [{} | key:{}]",
+                idx + 1,
+                marker,
+                entry.display_model_ref,
+                entry.source,
+                credential
+            );
+        }
+    }
+
+    response.push_str(
+        "\nQuick actions: `/model <number>`, `/model <provider/model>`, `/model save`, `/models current`, `/models fallback`.",
+    );
+    response
+}
+
+fn build_models_current_response(
+    current: &ChannelRouteSelection,
+    defaults: &ChannelRuntimeDefaults,
+) -> String {
+    format!(
+        "Current session: provider=`{}`, model=`{}`\nWorkspace default: provider=`{}`, model=`{}`\nUse `/model save` to persist current session model as workspace default.",
+        current.provider, current.model, defaults.default_provider, defaults.model
+    )
+}
+
+fn build_models_fallback_response(config: &Config, defaults: &ChannelRuntimeDefaults) -> String {
+    if config.models.default.fallbacks.is_empty() {
+        return format!(
+            "Workspace default fallback chain is empty.\nDefault model: `{}`",
+            defaults.model
+        );
+    }
+
+    let mut lines = Vec::with_capacity(config.models.default.fallbacks.len() + 2);
+    lines.push(format!("Default model: `{}`", defaults.model));
+    lines.push("Fallback chain:".to_string());
+    lines.extend(
+        config
+            .models
+            .default
+            .fallbacks
+            .iter()
+            .enumerate()
+            .map(|(idx, model)| format!("{}. `{}`", idx + 1, model)),
+    );
+    lines.join("\n")
 }
 
 fn pending_shell_approval_for_sender(sender_key: &str) -> bool {
@@ -1437,38 +1940,6 @@ async fn create_resilient_provider_nonblocking(
     .context("failed to join provider initialization task")?
 }
 
-fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
-    let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
-    );
-    response.push_str(
-        "\nUse `/model <number>` or `/model <model-id>` to switch. Use `/status` for full runtime status.\n",
-    );
-
-    let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
-    if cached_models.is_empty() {
-        let _ = writeln!(
-            response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `freeclaw models refresh --provider {}`.",
-            current.provider, current.provider
-        );
-    } else {
-        let _ = writeln!(
-            response,
-            "\nCached model IDs (top {}):",
-            cached_models.len()
-        );
-        for (idx, model) in cached_models.iter().enumerate() {
-            let _ = writeln!(response, "{}. `{model}`", idx + 1);
-        }
-    }
-
-    response
-}
-
 async fn build_status_response(
     ctx: &ChannelRuntimeContext,
     current: &ChannelRouteSelection,
@@ -1491,18 +1962,45 @@ async fn build_status_response(
         }
     }
 
-    fn reasoning_detail_for_provider(provider_name: &str, override_value: Option<bool>) -> String {
+    fn reasoning_detail_for_provider(
+        provider_name: &str,
+        override_value: Option<bool>,
+        reasoning_level: Option<&str>,
+    ) -> String {
         let provider = provider_name.to_ascii_lowercase();
+        let normalized_level = crate::providers::normalize_reasoning_level(reasoning_level);
         let qwen_or_kimi_like = provider.contains("qwen")
             || provider.contains("dashscope")
             || provider.contains("kimi")
             || provider.contains("moonshot");
         match override_value {
             Some(true) if provider == "anthropic" => {
-                "thinking.type=enabled, budget_tokens=1024".to_string()
+                if let Some(budget_tokens) =
+                    crate::providers::anthropic_thinking_budget_for_level(Some(normalized_level))
+                {
+                    format!(
+                        "thinking.type=enabled, level={normalized_level}, budget_tokens={budget_tokens}"
+                    )
+                } else {
+                    "disabled".to_string()
+                }
             }
-            Some(true) if qwen_or_kimi_like => "enable_thinking=true".to_string(),
-            Some(true) => "reasoning_effort=high".to_string(),
+            Some(true) if qwen_or_kimi_like => {
+                if normalized_level == "off" {
+                    "enable_thinking=false".to_string()
+                } else {
+                    format!("enable_thinking=true (level={normalized_level})")
+                }
+            }
+            Some(true) => {
+                if let Some(effort) =
+                    crate::providers::reasoning_effort_for_level(Some(normalized_level))
+                {
+                    format!("reasoning_effort={effort}")
+                } else {
+                    "disabled".to_string()
+                }
+            }
             Some(false) if qwen_or_kimi_like => "enable_thinking=false".to_string(),
             Some(false) => "disabled".to_string(),
             None => "provider-managed default".to_string(),
@@ -1537,6 +2035,7 @@ async fn build_status_response(
     let reasoning_detail = reasoning_detail_for_provider(
         &current.provider,
         ctx.provider_runtime_options.reasoning_enabled,
+        ctx.provider_runtime_options.reasoning_level.as_deref(),
     );
     let runtime_config = runtime_config_path(ctx)
         .map(|path| path.display().to_string())
@@ -1642,7 +2141,7 @@ async fn build_status_response(
         runtime_config
     );
     response.push_str(
-        "\nCommands: `/status`, `/models list|status|<provider>`, `/model list|status|<number>|<model-id>`, `/memory clean|current`, `/memory clean confirm|current confirm`, `/memory clean all`, `/memory clean all confirm`, `/new`, `/reset`.",
+        "\nCommands: `/status`, `/models`, `/models current`, `/models fallback`, `/models providers`, `/models <provider>`, `/model <number>|<provider/model>|save`, `/memory clean|current`, `/memory clean confirm|current confirm`, `/memory clean all`, `/memory clean all confirm`, `/new`, `/reset`.",
     );
     response
 }
@@ -1655,10 +2154,11 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
         current.provider, current.model
     );
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
-    response
-        .push_str("Use `/models list` to show providers, `/models status` for current status.\n");
     response.push_str(
-        "Use `/model list` to show models, `/model <number>` or `/model <model-id>` to switch.\n\n",
+        "Use `/models providers` to show providers. Use `/models` for configured model pool.\n",
+    );
+    response.push_str(
+        "Use `/model <number>` or `/model <provider/model>` to switch session model, and `/model save` to persist current session as default.\n\n",
     );
     response.push_str(
         "Use `/memory clean` (or `/memory clean current`) to preview sender-scoped conversation memories, then `/memory clean confirm` to delete.\n",
@@ -1683,6 +2183,46 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+async fn save_sender_default_model(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    current: &ChannelRouteSelection,
+) -> String {
+    let Some(config_path) = runtime_config_path(ctx) else {
+        return "Cannot persist workspace default in this runtime context.".to_string();
+    };
+
+    let mut config = match load_runtime_config_from_file(&config_path).await {
+        Ok(config) => config,
+        Err(err) => {
+            let safe_err = providers::sanitize_api_error(&err.to_string());
+            return format!("Failed to load config for save.\nDetails: {safe_err}");
+        }
+    };
+
+    config.default_provider = Some(current.provider.clone());
+    config.default_model = Some(current.model.clone());
+    config.sync_models_primary_from_legacy_defaults();
+    if let Err(err) = config.save().await {
+        let safe_err = providers::sanitize_api_error(&err.to_string());
+        return format!("Failed to save workspace default model.\nDetails: {safe_err}");
+    }
+
+    if let Err(err) = maybe_apply_runtime_config_update(ctx).await {
+        let safe_err = providers::sanitize_api_error(&err.to_string());
+        return format!(
+            "Saved workspace default to `{}` on `{}`, but runtime reload failed.\nDetails: {safe_err}",
+            current.model, current.provider
+        );
+    }
+
+    set_route_selection(ctx, sender_key, current.clone());
+    format!(
+        "Workspace default saved: provider=`{}`, model=`{}`.\nSession now follows the updated default.",
+        current.provider, current.model
+    )
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -1700,12 +2240,41 @@ async fn handle_runtime_command_if_needed(
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
+        ChannelRuntimeCommand::ShowModelsOverview => {
+            match load_runtime_config_for_model_commands(ctx).await {
+                Ok(config) => {
+                    let defaults = runtime_defaults_snapshot(ctx);
+                    let entries = build_configured_model_entries(&config, &current);
+                    build_models_overview_response(&current, &defaults, &entries)
+                }
+                Err(err) => {
+                    let safe_err = providers::sanitize_api_error(&err.to_string());
+                    format!("Failed to load configured model list.\nDetails: {safe_err}")
+                }
+            }
+        }
+        ChannelRuntimeCommand::ShowModelsCurrent => {
+            let defaults = runtime_defaults_snapshot(ctx);
+            build_models_current_response(&current, &defaults)
+        }
+        ChannelRuntimeCommand::ShowModelsFallback => {
+            match load_runtime_config_for_model_commands(ctx).await {
+                Ok(config) => {
+                    let defaults = runtime_defaults_snapshot(ctx);
+                    build_models_fallback_response(&config, &defaults)
+                }
+                Err(err) => {
+                    let safe_err = providers::sanitize_api_error(&err.to_string());
+                    format!("Failed to load fallback chain.\nDetails: {safe_err}")
+                }
+            }
+        }
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::ShowStatus => {
             build_status_response(ctx, &current, &sender_key, &msg.channel).await
         }
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
-            match resolve_provider_alias(&raw_provider) {
+            match resolve_provider_alias_for_runtime_command(ctx, &raw_provider).await {
                 Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
                     Ok(_) => {
                         if provider_name != current.provider {
@@ -1727,37 +2296,68 @@ async fn handle_runtime_command_if_needed(
                     }
                 },
                 None => format!(
-                    "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
+                    "Unknown provider `{raw_provider}`. Use `/models providers` for built-ins, or `/model` to pick from configured model pool."
                 ),
             }
-        }
-        ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path())
         }
         ChannelRuntimeCommand::SetModelByIndex(index) => {
             if index == 0 {
                 "Invalid model index `0`. Use `/model list` to see valid model numbers.".to_string()
             } else {
-                let available_models =
-                    load_cached_models(ctx.workspace_dir.as_path(), &current.provider);
-                if available_models.is_empty() {
-                    format!(
-                        "No cached model list found for `{}`. Ask the operator to run `freeclaw models refresh --provider {}`.",
-                        current.provider, current.provider
-                    )
-                } else if index > available_models.len() {
-                    format!(
-                        "Invalid model index `{index}`. Use `/model list` to see valid model numbers."
-                    )
-                } else {
-                    let model = available_models[index - 1].clone();
-                    current.model = model.clone();
-                    set_route_selection(ctx, &sender_key, current.clone());
-                    clear_sender_history(ctx, &sender_key);
-                    format!(
-                        "Model switched to `{model}` for provider `{}` in this sender session.",
-                        current.provider
-                    )
+                match load_runtime_config_for_model_commands(ctx).await {
+                    Ok(config) => {
+                        let entries = build_configured_model_entries(&config, &current);
+                        if entries.is_empty() {
+                            "No configured model entries found. Use `/models` to inspect current config."
+                                .to_string()
+                        } else if index > entries.len() {
+                            format!(
+                                "Invalid model index `{index}`. Use `/model` to see valid numbers."
+                            )
+                        } else {
+                            let selected = entries[index - 1].clone();
+                            let target_provider = resolve_provider_for_model_selection(
+                                ctx,
+                                Some(&config),
+                                &selected.provider,
+                            )
+                            .await;
+                            if target_provider != current.provider {
+                                match get_or_create_provider(ctx, &target_provider).await {
+                                    Ok(_) => {
+                                        current.provider = target_provider.clone();
+                                        current.model = selected.model.clone();
+                                        set_route_selection(ctx, &sender_key, current.clone());
+                                        clear_sender_history(ctx, &sender_key);
+                                        format!(
+                                            "Session model switched to `{}`.",
+                                            selected.display_model_ref
+                                        )
+                                    }
+                                    Err(err) => {
+                                        let safe_err =
+                                            providers::sanitize_api_error(&err.to_string());
+                                        format!(
+                                            "Failed to initialize provider `{}`.\nDetails: {safe_err}",
+                                            target_provider
+                                        )
+                                    }
+                                }
+                            } else {
+                                current.model = selected.model.clone();
+                                set_route_selection(ctx, &sender_key, current.clone());
+                                clear_sender_history(ctx, &sender_key);
+                                format!(
+                                    "Session model switched to `{}`.",
+                                    selected.display_model_ref
+                                )
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let safe_err = providers::sanitize_api_error(&err.to_string());
+                        format!("Failed to load configured model list.\nDetails: {safe_err}")
+                    }
                 }
             }
         }
@@ -1765,16 +2365,48 @@ async fn handle_runtime_command_if_needed(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
-            } else {
-                current.model = model.clone();
-                set_route_selection(ctx, &sender_key, current.clone());
-                clear_sender_history(ctx, &sender_key);
+            } else if let Some((next_provider, next_model)) =
+                parse_model_ref_for_channel(&model, &current.provider)
+            {
+                let next_provider =
+                    resolve_provider_for_model_selection(ctx, None, &next_provider).await;
+                if next_provider != current.provider {
+                    match get_or_create_provider(ctx, &next_provider).await {
+                        Ok(_) => {
+                            current.provider = next_provider.clone();
+                            current.model = next_model.clone();
+                            set_route_selection(ctx, &sender_key, current.clone());
+                            clear_sender_history(ctx, &sender_key);
 
-                format!(
-                    "Model switched to `{model}` for provider `{}` in this sender session.",
-                    current.provider
-                )
+                            format!(
+                                "Session model switched to `{}`.",
+                                format!("{}/{}", current.provider, next_model)
+                            )
+                        }
+                        Err(err) => {
+                            let safe_err = providers::sanitize_api_error(&err.to_string());
+                            format!(
+                                "Failed to initialize provider `{}`.\nDetails: {safe_err}",
+                                next_provider
+                            )
+                        }
+                    }
+                } else {
+                    current.model = next_model.clone();
+                    set_route_selection(ctx, &sender_key, current.clone());
+                    clear_sender_history(ctx, &sender_key);
+
+                    format!(
+                        "Session model switched to `{}`.",
+                        format!("{}/{}", current.provider, next_model)
+                    )
+                }
+            } else {
+                "Model ref must be `<provider>/<model>` or a non-empty model id.".to_string()
             }
+        }
+        ChannelRuntimeCommand::SaveModelAsDefault => {
+            save_sender_default_model(ctx, &sender_key, &current).await
         }
         ChannelRuntimeCommand::ShowMemoryHelp => build_memory_help_response(),
         ChannelRuntimeCommand::PrepareMemoryClean(scope) => {
@@ -3937,6 +4569,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         freeclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
+        reasoning_level: Some(config.runtime.reasoning_level.clone()),
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
@@ -4318,15 +4951,27 @@ mod tests {
         );
         assert_eq!(
             parse_runtime_command("telegram", "/models"),
-            Some(ChannelRuntimeCommand::ShowProviders)
+            Some(ChannelRuntimeCommand::ShowModelsOverview)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/models list"),
-            Some(ChannelRuntimeCommand::ShowProviders)
+            Some(ChannelRuntimeCommand::ShowModelsOverview)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/models status"),
-            Some(ChannelRuntimeCommand::ShowStatus)
+            Some(ChannelRuntimeCommand::ShowModelsCurrent)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models current"),
+            Some(ChannelRuntimeCommand::ShowModelsCurrent)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models fallback"),
+            Some(ChannelRuntimeCommand::ShowModelsFallback)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/models providers"),
+            Some(ChannelRuntimeCommand::ShowProviders)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/models openrouter"),
@@ -4334,15 +4979,19 @@ mod tests {
         );
         assert_eq!(
             parse_runtime_command("telegram", "/model"),
-            Some(ChannelRuntimeCommand::ShowModel)
+            Some(ChannelRuntimeCommand::ShowModelsOverview)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/model list"),
-            Some(ChannelRuntimeCommand::ShowModel)
+            Some(ChannelRuntimeCommand::ShowModelsOverview)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/model status"),
-            Some(ChannelRuntimeCommand::ShowStatus)
+            Some(ChannelRuntimeCommand::ShowModelsCurrent)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/model save"),
+            Some(ChannelRuntimeCommand::SaveModelAsDefault)
         );
         assert_eq!(
             parse_runtime_command("telegram", "/model 2"),
@@ -4400,8 +5049,94 @@ mod tests {
             parse_runtime_command("telegram", "/reset"),
             Some(ChannelRuntimeCommand::ResetSession)
         );
-        assert_eq!(parse_runtime_command("slack", "/model 2"), None);
-        assert_eq!(parse_runtime_command("slack", "/memory clean"), None);
+        assert_eq!(
+            parse_runtime_command("slack", "/model 2"),
+            Some(ChannelRuntimeCommand::SetModelByIndex(2))
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/memory clean"),
+            Some(ChannelRuntimeCommand::PrepareMemoryClean(
+                MemoryCleanupScope::SenderConversation
+            ))
+        );
+        assert_eq!(parse_runtime_command("", "/model 2"), None);
+    }
+
+    #[test]
+    fn compact_provider_for_display_strips_url_scheme_for_custom_provider() {
+        assert_eq!(
+            compact_provider_for_display("anthropic-custom:https://dm-fox.rjj.cc/claude/droid"),
+            "anthropic-custom:dm-fox.rjj.cc/claude/droid"
+        );
+        assert_eq!(
+            compact_provider_for_display("custom:http://anyrouter.top/anthropic-messages"),
+            "custom:anyrouter.top/anthropic-messages"
+        );
+    }
+
+    #[test]
+    fn build_configured_model_entries_uses_profile_key_for_display_model_ref() {
+        let mut config = Config::default();
+        config.default_provider = Some("kimi-code".to_string());
+        config.default_model = Some("k2p5".to_string());
+        config.models.default.primary = Some("kimi-code/k2p5".to_string());
+        config.model_providers.insert(
+            "newcli-anthropic".to_string(),
+            ModelProviderConfig {
+                name: Some("anthropic".to_string()),
+                base_url: Some("https://dm-fox.rjj.cc/claude/droid".to_string()),
+                api_key: None,
+                wire_api: None,
+                requires_openai_auth: false,
+            },
+        );
+        config.model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "opus".to_string(),
+            provider: "anthropic-custom:https://dm-fox.rjj.cc/claude/droid".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            api_key: None,
+        }];
+
+        let current = ChannelRouteSelection {
+            provider: "kimi-code".to_string(),
+            model: "k2p5".to_string(),
+        };
+
+        let entries = build_configured_model_entries(&config, &current);
+        let route_entry = entries
+            .iter()
+            .find(|entry| entry.source == "model_routes.opus")
+            .expect("route entry should exist");
+
+        assert_eq!(
+            route_entry.model_ref,
+            "anthropic-custom:https://dm-fox.rjj.cc/claude/droid/claude-opus-4-6"
+        );
+        assert_eq!(
+            route_entry.display_model_ref,
+            "newcli-anthropic/claude-opus-4-6"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_from_profile_alias_maps_profile_key_to_runtime_provider() {
+        let mut config = Config::default();
+        config.model_providers.insert(
+            "anyrouter".to_string(),
+            ModelProviderConfig {
+                name: Some("anthropic".to_string()),
+                base_url: Some("https://anyrouter.top".to_string()),
+                api_key: None,
+                wire_api: None,
+                requires_openai_auth: false,
+            },
+        );
+
+        let resolved = resolve_provider_from_profile_alias(&config, "anyrouter");
+        assert_eq!(
+            resolved.as_deref(),
+            Some("anthropic-custom:https://anyrouter.top")
+        );
     }
 
     #[test]
@@ -5428,11 +6163,25 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let workspace = TempDir::new().expect("temp dir");
         std::fs::create_dir_all(workspace.path().join("state")).expect("create state dir");
+        let freeclaw_dir = workspace.path().join(".freeclaw");
+        std::fs::create_dir_all(&freeclaw_dir).expect("create freeclaw dir");
         std::fs::write(
-            workspace.path().join("state").join(MODEL_CACHE_FILE),
-            r#"{"entries":[{"provider":"openrouter","models":["model-a","model-b","model-c"]}]}"#,
+            freeclaw_dir.join("config.toml"),
+            r#"
+default_provider = "openrouter"
+default_model = "default-model"
+
+[models.default]
+primary = "openrouter/default-model"
+fallbacks = ["openrouter/model-a", "openrouter/model-b", "openrouter/model-c"]
+"#,
         )
-        .expect("write model cache");
+        .expect("write config");
+
+        let provider_runtime_options = providers::ProviderRuntimeOptions {
+            freeclaw_dir: Some(freeclaw_dir),
+            ..providers::ProviderRuntimeOptions::default()
+        };
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -5453,7 +6202,7 @@ BTC is currently around $65,000 based on latest tool output."#
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            provider_runtime_options,
             workspace_dir: Arc::new(workspace.path().to_path_buf()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
@@ -5468,7 +6217,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 id: "msg-model-index-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
-                content: "/model 2".to_string(),
+                content: "/model 3".to_string(),
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
@@ -5479,7 +6228,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Model switched to `model-b`"));
+        assert!(sent[0].contains("Session model switched to `openrouter/model-b`"));
 
         let route_key = "telegram_alice";
         let route = runtime_ctx
@@ -5493,6 +6242,318 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(route.model, "model-b");
 
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_model_index_resolves_profile_provider_alias() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let profile_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let profile_provider: Arc<dyn Provider> = profile_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert(
+            "anthropic-custom:https://anyrouter.top".to_string(),
+            profile_provider,
+        );
+
+        let workspace = TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(workspace.path().join("state")).expect("create state dir");
+        let freeclaw_dir = workspace.path().join(".freeclaw");
+        std::fs::create_dir_all(&freeclaw_dir).expect("create freeclaw dir");
+        std::fs::write(
+            freeclaw_dir.join("config.toml"),
+            r#"
+default_provider = "openrouter"
+default_model = "default-model"
+
+[models.default]
+primary = "openrouter/default-model"
+fallbacks = ["anyrouter/claude-opus-4-6"]
+
+[model_providers.anyrouter]
+name = "anthropic"
+base_url = "https://anyrouter.top"
+"#,
+        )
+        .expect("write config");
+
+        let provider_runtime_options = providers::ProviderRuntimeOptions {
+            freeclaw_dir: Some(freeclaw_dir),
+            ..providers::ProviderRuntimeOptions::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options,
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-model-index-profile-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/model 2".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Session model switched to `anyrouter/claude-opus-4-6`"));
+
+        let route_key = "telegram_alice";
+        let route = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route_key)
+            .cloned()
+            .expect("route should be stored for sender");
+        assert_eq!(route.provider, "anthropic-custom:https://anyrouter.top");
+        assert_eq!(route.model, "claude-opus-4-6");
+
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(profile_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_switches_provider_by_profile_alias_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let profile_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let profile_provider: Arc<dyn Provider> = profile_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert(
+            "anthropic-custom:https://anyrouter.top".to_string(),
+            profile_provider,
+        );
+
+        let workspace = TempDir::new().expect("temp dir");
+        let freeclaw_dir = workspace.path().join(".freeclaw");
+        std::fs::create_dir_all(&freeclaw_dir).expect("create freeclaw dir");
+        std::fs::write(
+            freeclaw_dir.join("config.toml"),
+            r#"
+default_provider = "openrouter"
+default_model = "default-model"
+
+[model_providers.anyrouter]
+name = "anthropic"
+base_url = "https://anyrouter.top"
+"#,
+        )
+        .expect("write config");
+
+        let provider_runtime_options = providers::ProviderRuntimeOptions {
+            freeclaw_dir: Some(freeclaw_dir),
+            ..providers::ProviderRuntimeOptions::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options,
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-profile-provider-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/models anyrouter".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].contains("Provider switched to `anthropic-custom:https://anyrouter.top`"),
+            "unexpected reply: {}",
+            sent[0]
+        );
+
+        let route_key = "telegram_alice";
+        let route = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route_key)
+            .cloned()
+            .expect("route should be stored for sender");
+        assert_eq!(route.provider, "anthropic-custom:https://anyrouter.top");
+        assert_eq!(route.model, "default-model");
+
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(profile_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_model_save_persists_workspace_default() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let workspace = TempDir::new().expect("temp dir");
+        let freeclaw_dir = workspace.path().join(".freeclaw");
+        std::fs::create_dir_all(&freeclaw_dir).expect("create freeclaw dir");
+        std::fs::write(
+            freeclaw_dir.join("config.toml"),
+            r#"
+default_provider = "openrouter"
+default_model = "default-model"
+
+[models.default]
+primary = "openrouter/default-model"
+"#,
+        )
+        .expect("write config");
+
+        let provider_runtime_options = providers::ProviderRuntimeOptions {
+            freeclaw_dir: Some(freeclaw_dir.clone()),
+            ..providers::ProviderRuntimeOptions::default()
+        };
+
+        let mut route_overrides = HashMap::new();
+        route_overrides.insert(
+            "telegram_alice".to_string(),
+            ChannelRouteSelection {
+                provider: "openrouter".to_string(),
+                model: "model-b".to_string(),
+            },
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(route_overrides)),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options,
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-model-save-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/model save".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Workspace default saved"));
+        drop(sent);
+
+        let saved = std::fs::read_to_string(freeclaw_dir.join("config.toml")).expect("read config");
+        assert!(saved.contains("default_provider = \"openrouter\""));
+        assert!(saved.contains("default_model = \"model-b\""));
+        assert!(saved.contains("primary = \"openrouter/model-b\""));
     }
 
     #[tokio::test]
@@ -5765,7 +6826,9 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         assert!(
-            forgotten_keys.iter().any(|key| key == "telegram_alice_msg-a"),
+            forgotten_keys
+                .iter()
+                .any(|key| key == "telegram_alice_msg-a"),
             "sender-scoped conversation memory should be deleted on /reset"
         );
         assert!(

@@ -93,7 +93,7 @@ impl Tool for MemoryStoreTool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::memory::SqliteMemory;

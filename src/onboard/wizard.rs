@@ -146,6 +146,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
+        models: crate::config::schema::ModelsConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config,
@@ -340,6 +341,7 @@ fn apply_provider_update(
 ) {
     config.default_provider = Some(provider);
     config.default_model = Some(model);
+    config.sync_models_primary_from_legacy_defaults();
     config.api_url = provider_api_url;
     config.api_key = if api_key.trim().is_empty() {
         None
@@ -497,6 +499,7 @@ async fn run_quick_setup_with_home(
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
+        models: crate::config::schema::ModelsConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         cron: crate::config::CronConfig::default(),
         channels_config: ChannelsConfig::default(),
@@ -1726,7 +1729,7 @@ pub async fn run_models_refresh(
     force: bool,
 ) -> Result<()> {
     let provider_name = provider_override
-        .or(config.default_provider.as_deref())
+        .or(Some(config.resolved_default_provider()))
         .unwrap_or("openrouter")
         .trim()
         .to_string();
@@ -1810,7 +1813,7 @@ pub async fn run_models_refresh(
 
 pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
     let provider_name = provider_override
-        .or(config.default_provider.as_deref())
+        .or(Some(config.resolved_default_provider()))
         .unwrap_or("openrouter");
 
     let cached = load_any_cached_models_for_provider(&config.workspace_dir, provider_name).await?;
@@ -1833,7 +1836,7 @@ pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -
     );
     println!();
     for model in &cached.models {
-        let marker = if config.default_model.as_deref() == Some(model.as_str()) {
+        let marker = if config.resolved_default_model() == model {
             "* "
         } else {
             "  "
@@ -1851,22 +1854,51 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
     }
 
     let mut updated = config.clone();
-    updated.default_model = Some(model.to_string());
+    if let Some((provider, model_id)) = model.split_once('/') {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        if provider.is_empty() || model_id.is_empty() {
+            anyhow::bail!("Model ref must be `provider/model` or a non-empty model id");
+        }
+        updated.default_provider = Some(provider.to_string());
+        updated.default_model = Some(model_id.to_string());
+    } else {
+        updated.default_model = Some(model.to_string());
+    }
+    updated.sync_models_primary_from_legacy_defaults();
     updated.save().await?;
 
     println!();
-    println!("  Default model set to '{}'.", style(model).green().bold());
+    println!(
+        "  Default model set to '{}'.",
+        style(format!(
+            "{}/{}",
+            updated.resolved_default_provider(),
+            updated.resolved_default_model()
+        ))
+        .green()
+        .bold()
+    );
     println!();
     Ok(())
 }
 
 pub async fn run_models_status(config: &Config) -> Result<()> {
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model = config.default_model.as_deref().unwrap_or("(not set)");
+    let provider = config.resolved_default_provider();
+    let model = config.resolved_default_model();
 
     println!();
     println!("  Provider:  {}", style(provider).cyan());
     println!("  Model:     {}", style(model).cyan());
+    if let Some(primary) = config.models.default.primary.as_deref() {
+        println!("  Primary:   {}", style(primary).cyan());
+    }
+    if !config.models.default.fallbacks.is_empty() {
+        println!(
+            "  Fallbacks: {}",
+            style(config.models.default.fallbacks.join(" -> ")).cyan()
+        );
+    }
     let temp_display = config
         .default_temperature
         .map(|value| format!("{value:.1}"))
@@ -5485,12 +5517,12 @@ fn print_summary(config: &Config) {
     println!(
         "    {} Provider:      {}",
         style("🤖").cyan(),
-        config.default_provider.as_deref().unwrap_or("openrouter")
+        config.resolved_default_provider()
     );
     println!(
         "    {} Model:         {}",
         style("🧠").cyan(),
-        config.default_model.as_deref().unwrap_or("(default)")
+        config.resolved_default_model()
     );
     println!(
         "    {} Autonomy:      {:?}",
@@ -5605,7 +5637,7 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+    let provider = config.resolved_default_provider();
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
         if provider == "openai-codex" {
             println!(

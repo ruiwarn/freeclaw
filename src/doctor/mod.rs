@@ -433,24 +433,36 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Provider validity
-    if let Some(ref provider) = config.default_provider {
-        if let Some(reason) = provider_validation_error(provider) {
-            items.push(DiagItem::error(
-                cat,
-                format!("default provider \"{provider}\" is invalid: {reason}"),
-            ));
-        } else {
-            items.push(DiagItem::ok(
-                cat,
-                format!("provider \"{provider}\" is valid"),
-            ));
-        }
+    let provider = config.resolved_default_provider();
+    if let Some(reason) = provider_validation_error(provider) {
+        items.push(DiagItem::error(
+            cat,
+            format!("default provider \"{provider}\" is invalid: {reason}"),
+        ));
     } else {
-        items.push(DiagItem::error(cat, "no default_provider configured"));
+        items.push(DiagItem::ok(
+            cat,
+            format!("provider \"{provider}\" is valid"),
+        ));
+    }
+    if let Some(primary) = config.models.default.primary.as_deref() {
+        items.push(DiagItem::ok(
+            cat,
+            format!("models.default.primary: {primary}"),
+        ));
+    }
+    if !config.models.default.fallbacks.is_empty() {
+        items.push(DiagItem::ok(
+            cat,
+            format!(
+                "models.default.fallbacks: {}",
+                config.models.default.fallbacks.join(" -> ")
+            ),
+        ));
     }
 
     // API key presence
-    if config.default_provider.as_deref() != Some("ollama") {
+    if config.resolved_default_provider() != "ollama" {
         if config.api_key.is_some() {
             items.push(DiagItem::ok(cat, "API key configured"));
         } else {
@@ -462,13 +474,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model configured
-    if config.default_model.is_some() {
+    if config.default_model.is_some() || config.models.default.primary.is_some() {
         items.push(DiagItem::ok(
             cat,
-            format!(
-                "default model: {}",
-                config.default_model.as_deref().unwrap_or("?")
-            ),
+            format!("default model: {}", config.resolved_default_model()),
         ));
     } else {
         items.push(DiagItem::warn(cat, "no default_model configured"));

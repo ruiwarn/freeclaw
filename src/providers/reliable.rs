@@ -2,9 +2,10 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
 };
 use super::Provider;
+use crate::config::schema::ProviderModelFallback;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -231,6 +232,8 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Per-model fallback chains with explicit provider/model pairing.
+    model_provider_fallbacks: HashMap<String, Vec<ProviderModelFallback>>,
 }
 
 impl ReliableProvider {
@@ -246,6 +249,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            model_provider_fallbacks: HashMap::new(),
         }
     }
 
@@ -261,6 +265,15 @@ impl ReliableProvider {
         self
     }
 
+    /// Set per-model fallback chains with explicit provider/model pairing.
+    pub fn with_model_provider_fallbacks(
+        mut self,
+        fallbacks: HashMap<String, Vec<ProviderModelFallback>>,
+    ) -> Self {
+        self.model_provider_fallbacks = fallbacks;
+        self
+    }
+
     /// Build the list of models to try: [original, fallback1, fallback2, ...]
     fn model_chain<'a>(&'a self, model: &'a str) -> Vec<&'a str> {
         let mut chain = vec![model];
@@ -268,6 +281,38 @@ impl ReliableProvider {
             chain.extend(fallbacks.iter().map(|s| s.as_str()));
         }
         chain
+    }
+
+    /// Build a provider+model chain for a given model when explicit pair
+    /// mappings are available.
+    fn provider_model_chain(&self, model: &str) -> Option<Vec<(String, String)>> {
+        let Some(primary_provider) = self.providers.first().map(|(name, _)| name.clone()) else {
+            return None;
+        };
+        let Some(fallbacks) = self.model_provider_fallbacks.get(model) else {
+            return None;
+        };
+
+        let mut chain = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+
+        let primary_pair = (primary_provider, model.to_string());
+        seen.insert(primary_pair.clone());
+        chain.push(primary_pair);
+
+        for fallback in fallbacks {
+            let provider = fallback.provider.trim();
+            let fallback_model = fallback.model.trim();
+            if provider.is_empty() || fallback_model.is_empty() {
+                continue;
+            }
+            let candidate = (provider.to_string(), fallback_model.to_string());
+            if seen.insert(candidate.clone()) {
+                chain.push(candidate);
+            }
+        }
+
+        Some(chain)
     }
 
     /// Advance to the next API key and return it, or None if no extra keys configured.
@@ -309,8 +354,125 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let models = self.model_chain(model);
         let mut failures = Vec::new();
+
+        if let Some(candidates) = self.provider_model_chain(model) {
+            for (candidate_provider, candidate_model) in &candidates {
+                let Some((provider_name, provider)) = self
+                    .providers
+                    .iter()
+                    .find(|(name, _)| name == candidate_provider)
+                else {
+                    push_failure(
+                        &mut failures,
+                        candidate_provider,
+                        candidate_model,
+                        1,
+                        1,
+                        "non_retryable",
+                        "fallback provider not configured",
+                    );
+                    continue;
+                };
+
+                let mut backoff_ms = self.base_backoff_ms;
+                for attempt in 0..=self.max_retries {
+                    match provider
+                        .chat_with_system(system_prompt, message, candidate_model, temperature)
+                        .await
+                    {
+                        Ok(resp) => {
+                            if attempt > 0 || candidate_model != model {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt,
+                                    original_model = model,
+                                    "Provider recovered (pair failover/retry)"
+                                );
+                            }
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
+
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                candidate_model,
+                                attempt + 1,
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
+
+                            if rate_limited && !non_retryable_rate_limit {
+                                if let Some(new_key) = self.rotate_key() {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        error = %error_detail,
+                                        "Rate limited; key rotation selected key ending ...{} \
+                                         but cannot apply (Provider trait has no set_api_key). \
+                                         Retrying with original key.",
+                                        &new_key[new_key.len().saturating_sub(4)..]
+                                    );
+                                }
+                            }
+
+                            if non_retryable {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    error = %error_detail,
+                                    "Non-retryable error, moving on"
+                                );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
+                                break;
+                            }
+
+                            if attempt < self.max_retries {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt = attempt + 1,
+                                    backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
+                                    "Provider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    provider = provider_name,
+                    model = candidate_model,
+                    "Exhausted retries, trying next provider/model pair"
+                );
+            }
+
+            anyhow::bail!(
+                "All providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            );
+        }
+
+        let models = self.model_chain(model);
 
         // Outer: model fallback chain. Middle: provider priority. Inner: retries.
         // Each iteration: attempt one (provider, model) call. On success, return
@@ -433,8 +595,125 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let models = self.model_chain(model);
         let mut failures = Vec::new();
+
+        if let Some(candidates) = self.provider_model_chain(model) {
+            for (candidate_provider, candidate_model) in &candidates {
+                let Some((provider_name, provider)) = self
+                    .providers
+                    .iter()
+                    .find(|(name, _)| name == candidate_provider)
+                else {
+                    push_failure(
+                        &mut failures,
+                        candidate_provider,
+                        candidate_model,
+                        1,
+                        1,
+                        "non_retryable",
+                        "fallback provider not configured",
+                    );
+                    continue;
+                };
+
+                let mut backoff_ms = self.base_backoff_ms;
+                for attempt in 0..=self.max_retries {
+                    match provider
+                        .chat_with_history(messages, candidate_model, temperature)
+                        .await
+                    {
+                        Ok(resp) => {
+                            if attempt > 0 || candidate_model != model {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt,
+                                    original_model = model,
+                                    "Provider recovered (pair failover/retry)"
+                                );
+                            }
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
+
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                candidate_model,
+                                attempt + 1,
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
+
+                            if rate_limited && !non_retryable_rate_limit {
+                                if let Some(new_key) = self.rotate_key() {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        error = %error_detail,
+                                        "Rate limited; key rotation selected key ending ...{} \
+                                         but cannot apply (Provider trait has no set_api_key). \
+                                         Retrying with original key.",
+                                        &new_key[new_key.len().saturating_sub(4)..]
+                                    );
+                                }
+                            }
+
+                            if non_retryable {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    error = %error_detail,
+                                    "Non-retryable error, moving on"
+                                );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
+                                break;
+                            }
+
+                            if attempt < self.max_retries {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt = attempt + 1,
+                                    backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
+                                    "Provider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    provider = provider_name,
+                    model = candidate_model,
+                    "Exhausted retries, trying next provider/model pair"
+                );
+            }
+
+            anyhow::bail!(
+                "All providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            );
+        }
+
+        let models = self.model_chain(model);
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
@@ -557,8 +836,125 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let models = self.model_chain(model);
         let mut failures = Vec::new();
+
+        if let Some(candidates) = self.provider_model_chain(model) {
+            for (candidate_provider, candidate_model) in &candidates {
+                let Some((provider_name, provider)) = self
+                    .providers
+                    .iter()
+                    .find(|(name, _)| name == candidate_provider)
+                else {
+                    push_failure(
+                        &mut failures,
+                        candidate_provider,
+                        candidate_model,
+                        1,
+                        1,
+                        "non_retryable",
+                        "fallback provider not configured",
+                    );
+                    continue;
+                };
+
+                let mut backoff_ms = self.base_backoff_ms;
+                for attempt in 0..=self.max_retries {
+                    match provider
+                        .chat_with_tools(messages, tools, candidate_model, temperature)
+                        .await
+                    {
+                        Ok(resp) => {
+                            if attempt > 0 || candidate_model != model {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt,
+                                    original_model = model,
+                                    "Provider recovered (pair failover/retry)"
+                                );
+                            }
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
+
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                candidate_model,
+                                attempt + 1,
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
+
+                            if rate_limited && !non_retryable_rate_limit {
+                                if let Some(new_key) = self.rotate_key() {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        error = %error_detail,
+                                        "Rate limited; key rotation selected key ending ...{} \
+                                         but cannot apply (Provider trait has no set_api_key). \
+                                         Retrying with original key.",
+                                        &new_key[new_key.len().saturating_sub(4)..]
+                                    );
+                                }
+                            }
+
+                            if non_retryable {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    error = %error_detail,
+                                    "Non-retryable error, moving on"
+                                );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
+                                break;
+                            }
+
+                            if attempt < self.max_retries {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt = attempt + 1,
+                                    backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
+                                    "Provider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    provider = provider_name,
+                    model = candidate_model,
+                    "Exhausted retries, trying next provider/model pair"
+                );
+            }
+
+            anyhow::bail!(
+                "All providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            );
+        }
+
+        let models = self.model_chain(model);
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
@@ -667,8 +1063,126 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let models = self.model_chain(model);
         let mut failures = Vec::new();
+
+        if let Some(candidates) = self.provider_model_chain(model) {
+            for (candidate_provider, candidate_model) in &candidates {
+                let Some((provider_name, provider)) = self
+                    .providers
+                    .iter()
+                    .find(|(name, _)| name == candidate_provider)
+                else {
+                    push_failure(
+                        &mut failures,
+                        candidate_provider,
+                        candidate_model,
+                        1,
+                        1,
+                        "non_retryable",
+                        "fallback provider not configured",
+                    );
+                    continue;
+                };
+
+                let mut backoff_ms = self.base_backoff_ms;
+                for attempt in 0..=self.max_retries {
+                    let req = ChatRequest {
+                        messages: request.messages,
+                        tools: request.tools,
+                    };
+                    match provider.chat(req, candidate_model, temperature).await {
+                        Ok(resp) => {
+                            if attempt > 0 || candidate_model != model {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt,
+                                    original_model = model,
+                                    "Provider recovered (pair failover/retry)"
+                                );
+                            }
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
+
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                candidate_model,
+                                attempt + 1,
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
+
+                            if rate_limited && !non_retryable_rate_limit {
+                                if let Some(new_key) = self.rotate_key() {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        error = %error_detail,
+                                        "Rate limited; key rotation selected key ending ...{} \
+                                         but cannot apply (Provider trait has no set_api_key). \
+                                         Retrying with original key.",
+                                        &new_key[new_key.len().saturating_sub(4)..]
+                                    );
+                                }
+                            }
+
+                            if non_retryable {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    error = %error_detail,
+                                    "Non-retryable error, moving on"
+                                );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
+                                break;
+                            }
+
+                            if attempt < self.max_retries {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = candidate_model,
+                                    attempt = attempt + 1,
+                                    backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
+                                    "Provider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    provider = provider_name,
+                    model = candidate_model,
+                    "Exhausted retries, trying next provider/model pair"
+                );
+            }
+
+            anyhow::bail!(
+                "All providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            );
+        }
+
+        let models = self.model_chain(model);
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
@@ -1278,6 +1792,55 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], "claude-opus");
         assert_eq!(seen[1], "claude-sonnet");
+    }
+
+    #[tokio::test]
+    async fn provider_model_fallback_avoids_model_provider_cartesian_attempts() {
+        let primary = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["model-a", "model-b"],
+            response: "never",
+        });
+        let fallback = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["model-a"],
+            response: "ok from fallback model",
+        });
+
+        let mut pair_fallbacks = HashMap::new();
+        pair_fallbacks.insert(
+            "model-a".to_string(),
+            vec![ProviderModelFallback {
+                provider: "fallback".to_string(),
+                model: "model-b".to_string(),
+            }],
+        );
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(primary.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(fallback.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_model_provider_fallbacks(pair_fallbacks);
+
+        let result = provider.simple_chat("hello", "model-a", 0.0).await.unwrap();
+        assert_eq!(result, "ok from fallback model");
+
+        let primary_seen = primary.models_seen.lock();
+        let fallback_seen = fallback.models_seen.lock();
+        assert_eq!(primary_seen.clone(), vec!["model-a".to_string()]);
+        assert_eq!(fallback_seen.clone(), vec!["model-b".to_string()]);
     }
 
     #[tokio::test]

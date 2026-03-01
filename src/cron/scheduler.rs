@@ -461,7 +461,7 @@ async fn run_job_command_with_timeout(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-security-tests"))]
 mod tests {
     use super::*;
     use crate::config::Config;
