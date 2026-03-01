@@ -118,6 +118,7 @@ const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
+const STATUS_DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
@@ -164,6 +165,7 @@ enum ChannelRuntimeCommand {
     ConfirmMemoryClean(MemoryCleanupScope),
     NewSession,
     ResetSession,
+    RestartService,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -646,6 +648,10 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     !channel_name.trim().is_empty()
 }
 
+fn supports_restart_service_command(channel_name: &str) -> bool {
+    channel_name.eq_ignore_ascii_case("telegram")
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     if !supports_runtime_model_switch(channel_name) {
         return None;
@@ -740,8 +746,58 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         }
         "/new" => Some(ChannelRuntimeCommand::NewSession),
         "/reset" => Some(ChannelRuntimeCommand::ResetSession),
+        "/restart" if supports_restart_service_command(channel_name) => {
+            Some(ChannelRuntimeCommand::RestartService)
+        }
         _ => None,
     }
+}
+
+fn execute_service_restart_blocking() -> Result<()> {
+    #[cfg(test)]
+    {
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let output = Command::new("freeclaw")
+            .args(["service", "restart"])
+            .output()
+            .context("failed to execute `freeclaw service restart`")?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        anyhow::bail!(
+            "`freeclaw service restart` exited with status {}{}",
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", providers::sanitize_api_error(&detail))
+            }
+        );
+    }
+}
+
+fn schedule_service_restart() {
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let restart_result = tokio::task::spawn_blocking(execute_service_restart_blocking).await;
+        match restart_result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!("Failed to restart service via /restart command: {err}");
+            }
+            Err(err) => {
+                tracing::warn!("Restart task join failed via /restart command: {err}");
+            }
+        }
+    });
 }
 
 fn resolve_provider_alias(name: &str) -> Option<String> {
@@ -1946,6 +2002,41 @@ async fn build_status_response(
     sender_key: &str,
     channel_name: &str,
 ) -> String {
+    fn format_with_commas(value: usize) -> String {
+        let digits = value.to_string();
+        let len = digits.len();
+        let mut output = String::with_capacity(len + len / 3);
+        for (idx, ch) in digits.chars().enumerate() {
+            if idx > 0 && (len - idx).is_multiple_of(3) {
+                output.push(',');
+            }
+            output.push(ch);
+        }
+        output
+    }
+
+    fn estimate_tokens_from_text(text: &str) -> usize {
+        text.chars().count().div_ceil(4)
+    }
+
+    fn infer_context_window_tokens(model: &str) -> usize {
+        let lower = model.to_ascii_lowercase();
+        if lower.contains("gemini") {
+            return 1_048_576;
+        }
+        if lower.contains("claude") {
+            return 200_000;
+        }
+        if lower.contains("gpt-5")
+            || lower.contains("gpt-4.1")
+            || lower.starts_with("o1")
+            || lower.starts_with("o3")
+        {
+            return 200_000;
+        }
+        STATUS_DEFAULT_CONTEXT_WINDOW_TOKENS
+    }
+
     fn format_temperature(value: f64) -> String {
         if value.is_nan() {
             "provider-default".to_string()
@@ -2040,6 +2131,27 @@ async fn build_status_response(
     let runtime_config = runtime_config_path(ctx)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let estimated_history_tokens = history
+        .iter()
+        .map(|turn| estimate_tokens_from_text(&turn.content) + 8)
+        .sum::<usize>();
+    let estimated_system_tokens = estimate_tokens_from_text(ctx.system_prompt.as_str()) + 16;
+    let estimated_context_tokens = estimated_history_tokens + estimated_system_tokens;
+    let inferred_context_window_tokens = infer_context_window_tokens(&current.model);
+    let context_usage_percent = if inferred_context_window_tokens == 0 {
+        0.0
+    } else {
+        (estimated_context_tokens as f64 / inferred_context_window_tokens as f64) * 100.0
+    };
+    let context_usage_level = if context_usage_percent >= 95.0 {
+        "critical"
+    } else if context_usage_percent >= 85.0 {
+        "high"
+    } else if context_usage_percent >= 60.0 {
+        "medium"
+    } else {
+        "low"
+    };
     let api_url = ctx
         .api_url
         .as_deref()
@@ -2093,6 +2205,14 @@ async fn build_status_response(
     );
     let _ = writeln!(
         response,
+        "Context (estimated): used≈{} / {} tokens ({:.1}%, level={})",
+        format_with_commas(estimated_context_tokens),
+        format_with_commas(inferred_context_window_tokens),
+        context_usage_percent,
+        context_usage_level
+    );
+    let _ = writeln!(
+        response,
         "Runtime: timeout={}s, max_tool_iterations={}, interrupt_on_new_message={}",
         ctx.message_timeout_secs, ctx.max_tool_iterations, ctx.interrupt_on_new_message
     );
@@ -2141,7 +2261,7 @@ async fn build_status_response(
         runtime_config
     );
     response.push_str(
-        "\nCommands: `/status`, `/models`, `/models current`, `/models fallback`, `/models providers`, `/models <provider>`, `/model <number>|<provider/model>|save`, `/memory clean|current`, `/memory clean confirm|current confirm`, `/memory clean all`, `/memory clean all confirm`, `/new`, `/reset`.",
+        "\nCommands: `/status`, `/models`, `/models current`, `/models fallback`, `/models providers`, `/models <provider>`, `/model <number>|<provider/model>|save`, `/memory clean|current`, `/memory clean confirm|current confirm`, `/memory clean all`, `/memory clean all confirm`, `/new`, `/reset`, `/restart` (telegram).",
     );
     response
 }
@@ -2166,7 +2286,9 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response.push_str(
         "Use `/memory clean all` to preview all memory entries, then `/memory clean all confirm` to wipe everything.\n\n",
     );
-    response.push_str("Use `/new` to archive and start a new session, `/reset` to start a new session without archiving and clear sender-scoped conversation memory.\n\n");
+    response.push_str("Use `/new` to archive and start a new session, `/reset` to start a new session without archiving and clear sender-scoped conversation memory.\n");
+    response
+        .push_str("On Telegram you can use `/restart` to request `freeclaw service restart`.\n\n");
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
         if provider.aliases.is_empty() {
@@ -2459,6 +2581,10 @@ async fn handle_runtime_command_if_needed(
                     )
                 }
             }
+        }
+        ChannelRuntimeCommand::RestartService => {
+            schedule_service_restart();
+            "Service restart requested. Executing `freeclaw service restart`.".to_string()
         }
     };
 
@@ -5050,6 +5176,10 @@ mod tests {
             Some(ChannelRuntimeCommand::ResetSession)
         );
         assert_eq!(
+            parse_runtime_command("telegram", "/restart"),
+            Some(ChannelRuntimeCommand::RestartService)
+        );
+        assert_eq!(
             parse_runtime_command("slack", "/model 2"),
             Some(ChannelRuntimeCommand::SetModelByIndex(2))
         );
@@ -5059,6 +5189,7 @@ mod tests {
                 MemoryCleanupScope::SenderConversation
             ))
         );
+        assert_eq!(parse_runtime_command("slack", "/restart"), None);
         assert_eq!(parse_runtime_command("", "/model 2"), None);
     }
 
@@ -6148,6 +6279,69 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_handles_restart_command_without_llm_call() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-cmd-restart-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/restart".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Service restart requested."));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn process_channel_message_switches_model_by_index_without_llm_call() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -6622,6 +6816,8 @@ primary = "openrouter/default-model"
         assert!(sent[0].contains("Reasoning override: enabled"));
         assert!(!sent[0].contains("temperature=NaN"));
         assert!(sent[0].contains("Session: key=`telegram_alice`"));
+        assert!(sent[0].contains("Context (estimated): used≈"));
+        assert!(sent[0].contains("tokens ("));
 
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }

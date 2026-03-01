@@ -152,8 +152,8 @@ fn build_telegram_set_my_commands_request() -> serde_json::Value {
                 "description": "Start new session without archiving log"
             },
             {
-                "command": "bind",
-                "description": "Pair this Telegram account with /bind <code>"
+                "command": "restart",
+                "description": "Restart FreeClaw service"
             }
         ]
     })
@@ -2812,7 +2812,7 @@ mod tests {
         assert_eq!(commands[3]["command"], "memory");
         assert_eq!(commands[4]["command"], "new");
         assert_eq!(commands[5]["command"], "reset");
-        assert_eq!(commands[6]["command"], "bind");
+        assert_eq!(commands[6]["command"], "restart");
     }
 
     #[test]
