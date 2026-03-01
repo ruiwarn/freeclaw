@@ -777,6 +777,136 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
     })
 }
 
+const KIMI_MESSAGE_SIZE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+const KIMI_MESSAGE_SIZE_SAFETY_MARGIN_BYTES: usize = 64 * 1024;
+const KIMI_MESSAGE_SIZE_BUDGET_BYTES: usize =
+    KIMI_MESSAGE_SIZE_LIMIT_BYTES - KIMI_MESSAGE_SIZE_SAFETY_MARGIN_BYTES;
+
+fn should_apply_message_size_guard(provider_name: &str, base_url: &str, model: &str) -> bool {
+    let provider = provider_name.to_ascii_lowercase();
+    let base = base_url.to_ascii_lowercase();
+    let model_name = model.to_ascii_lowercase();
+
+    provider.contains("kimi")
+        || base.contains("kimi")
+        || base.contains("moonshot")
+        || model_name.contains("kimi")
+}
+
+fn truncate_to_utf8_tail(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    let mut start = input.len().saturating_sub(max_bytes);
+    while start < input.len() && !input.is_char_boundary(start) {
+        start += 1;
+    }
+
+    if start >= input.len() {
+        return String::new();
+    }
+
+    let suffix = &input[start..];
+    if max_bytes > 3 {
+        format!("...{suffix}")
+    } else {
+        suffix.to_string()
+    }
+}
+
+fn estimate_chat_messages_size_bytes(messages: &[ChatMessage]) -> usize {
+    let mut total = 0usize;
+    for message in messages {
+        total = total
+            .saturating_add(message.role.len())
+            .saturating_add(message.content.len())
+            // JSON structure overhead approximation per message.
+            .saturating_add(96);
+    }
+    total
+}
+
+fn guard_chat_messages_size(
+    messages: &[ChatMessage],
+    provider_name: &str,
+    base_url: &str,
+    model: &str,
+) -> Vec<ChatMessage> {
+    if !should_apply_message_size_guard(provider_name, base_url, model) {
+        return messages.to_vec();
+    }
+
+    let original_size = estimate_chat_messages_size_bytes(messages);
+    if original_size <= KIMI_MESSAGE_SIZE_BUDGET_BYTES {
+        return messages.to_vec();
+    }
+
+    let mut system_messages: Vec<ChatMessage> = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .cloned()
+        .collect();
+    let mut non_system_messages: Vec<ChatMessage> = messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .cloned()
+        .collect();
+
+    // Keep newest non-system messages first (reverse iterate then reverse back).
+    let mut kept_reversed: Vec<ChatMessage> = Vec::with_capacity(non_system_messages.len());
+    let mut size = estimate_chat_messages_size_bytes(&system_messages);
+
+    for message in non_system_messages.drain(..).rev() {
+        let msg_size = estimate_chat_messages_size_bytes(std::slice::from_ref(&message));
+        if size.saturating_add(msg_size) <= KIMI_MESSAGE_SIZE_BUDGET_BYTES {
+            size = size.saturating_add(msg_size);
+            kept_reversed.push(message);
+        }
+    }
+
+    kept_reversed.reverse();
+
+    // Guarantee at least the latest non-system message survives (possibly truncated).
+    if kept_reversed.is_empty() {
+        if let Some(mut last) = messages.iter().rev().find(|m| m.role != "system").cloned() {
+            let base = estimate_chat_messages_size_bytes(&system_messages)
+                .saturating_add(last.role.len())
+                .saturating_add(96);
+            let available = KIMI_MESSAGE_SIZE_BUDGET_BYTES.saturating_sub(base);
+            last.content = truncate_to_utf8_tail(&last.content, available);
+            kept_reversed.push(last);
+        }
+    }
+
+    let mut guarded = Vec::with_capacity(system_messages.len() + kept_reversed.len());
+    guarded.append(&mut system_messages);
+    guarded.extend(kept_reversed);
+
+    let guarded_size = estimate_chat_messages_size_bytes(&guarded);
+    if guarded_size > KIMI_MESSAGE_SIZE_BUDGET_BYTES {
+        if let Some(last) = guarded.iter_mut().rev().find(|m| m.role != "system") {
+            let without_last = guarded_size.saturating_sub(last.content.len());
+            let available = KIMI_MESSAGE_SIZE_BUDGET_BYTES.saturating_sub(without_last);
+            last.content = truncate_to_utf8_tail(&last.content, available);
+        }
+    }
+
+    tracing::warn!(
+        provider = %provider_name,
+        model = %model,
+        original_bytes = original_size,
+        budget_bytes = KIMI_MESSAGE_SIZE_BUDGET_BYTES,
+        kept_messages = guarded.len(),
+        "Applied chat message-size guard before provider request"
+    );
+
+    guarded
+}
+
 fn normalize_responses_role(role: &str) -> &'static str {
     match role {
         "assistant" | "tool" => "assistant",
@@ -1306,6 +1436,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             messages.to_vec()
         };
+        let effective_messages = guard_chat_messages_size(
+            &effective_messages,
+            &self.name,
+            &self.base_url,
+            model,
+        );
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -1418,6 +1554,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             messages.to_vec()
         };
+        let effective_messages = guard_chat_messages_size(
+            &effective_messages,
+            &self.name,
+            &self.base_url,
+            model,
+        );
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -1533,6 +1675,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             request.messages.to_vec()
         };
+        let effective_messages = guard_chat_messages_size(
+            &effective_messages,
+            &self.name,
+            &self.base_url,
+            model,
+        );
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(
