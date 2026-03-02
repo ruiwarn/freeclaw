@@ -761,6 +761,37 @@ fn execute_service_restart_blocking() -> Result<()> {
 
     #[allow(unreachable_code)]
     {
+        let mut failures = Vec::new();
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            match Command::new(&exe_path).args(["service", "restart"]).output() {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let detail = if !stderr.is_empty() { stderr } else { stdout };
+                    let message = format!(
+                        "`{} service restart` exited with status {}{}",
+                        exe_path.display(),
+                        output.status,
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", providers::sanitize_api_error(&detail))
+                        }
+                    );
+                    failures.push(message);
+                }
+                Err(err) => {
+                    failures.push(format!(
+                        "failed to execute `{} service restart`: {}",
+                        exe_path.display(),
+                        providers::sanitize_api_error(&err.to_string())
+                    ));
+                }
+            }
+        }
+
         let output = Command::new("freeclaw")
             .args(["service", "restart"])
             .output()
@@ -772,7 +803,7 @@ fn execute_service_restart_blocking() -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let detail = if !stderr.is_empty() { stderr } else { stdout };
-        anyhow::bail!(
+        failures.push(format!(
             "`freeclaw service restart` exited with status {}{}",
             output.status,
             if detail.is_empty() {
@@ -780,7 +811,9 @@ fn execute_service_restart_blocking() -> Result<()> {
             } else {
                 format!(": {}", providers::sanitize_api_error(&detail))
             }
-        );
+        ));
+
+        anyhow::bail!("{}", failures.join("; "));
     }
 }
 
