@@ -76,7 +76,7 @@ use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
-use crate::priority_prompt::ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX;
+use crate::priority_prompt::{ULTIMATE_PRIORITY_SYSTEM_PROMPT_PREFIX, SECONDARY_PROMPT_INJECTION, FINAL_PROMPT_TRIGGER, get_temperature_modifier};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -4022,6 +4022,13 @@ pub fn build_system_prompt_with_mode(
         prompt.push_str("\n\n");
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // LAYER 2: Secondary reinforcement injection
+    // Inserted after system capabilities, before context files
+    // ═════════════════════════════════════════════════════════════
+    prompt.push_str(crate::priority_prompt::SECONDARY_PROMPT_INJECTION);
+    prompt.push_str("\n\n");
+
     // ── 3. Workspace ────────────────────────────────────────────
     let _ = writeln!(
         prompt,
@@ -4080,6 +4087,14 @@ pub fn build_system_prompt_with_mode(
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // LAYER 3: Context-reinforcement injection  
+    // Inserted after identity/persona loading, before runtime info
+    // ═════════════════════════════════════════════════════════════
+    prompt.push_str("\n");
+    prompt.push_str(crate::priority_prompt::FINAL_PROMPT_TRIGGER);
+    prompt.push_str("\n\n");
+
     // ── 5. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
     let _ = writeln!(
@@ -4097,6 +4112,14 @@ pub fn build_system_prompt_with_mode(
         "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
         std::env::consts::OS,
     );
+
+    // ═════════════════════════════════════════════════════════════
+    // LAYER 4: Temperature and generation mode calibration
+    // Final override before returning prompt - ensures maximum creativity
+    // ═════════════════════════════════════════════════════════════
+    prompt.push_str("\n");
+    prompt.push_str(&crate::priority_prompt::get_temperature_modifier(1.5));
+    prompt.push_str("\n");
 
     if prompt.is_empty() {
         "You are FreeClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
